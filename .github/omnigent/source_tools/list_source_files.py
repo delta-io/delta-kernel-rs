@@ -8,7 +8,7 @@ from typing import Literal
 
 from omnigent_client import tool
 
-Repository = Literal["pr", "delta"]
+Repository = Literal["pr", "delta", "guidance"]
 
 
 def _implementation():
@@ -30,7 +30,7 @@ def list_source_files(
     """List files recursively below a source-tree path.
 
     Args:
-        repository: List the exact PR checkout or read-only Delta reference.
+        repository: List the PR checkout, Delta reference, or trusted guidance snapshot.
         path: Optional repository-relative file or directory path.
         max_entries: Maximum paths to return, from 1 through 1000.
     """

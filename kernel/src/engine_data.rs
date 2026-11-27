@@ -148,6 +148,15 @@ impl<'a> ListItem<'a> {
             .to_string()
     }
 
+    /// Iterates over this list's elements, preserving nulls.
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = Option<&'a str>> + use<'a> {
+        let values = self.values;
+        self.offsets
+            .clone()
+            .map(move |index| values.is_valid(index).then(|| values.value(index)))
+    }
+
     pub fn materialize(&self) -> Vec<String> {
         self.offsets
             .clone()
@@ -184,9 +193,19 @@ impl<'a> MapItem<'a> {
 
     /// Returns the map's keys in storage order, including keys whose value is null. Unlike
     /// [`MapItem::materialize`], which drops null-valued entries, this exposes the full key set.
-    pub(crate) fn keys(&self) -> impl Iterator<Item = &'a str> + 'a {
+    pub(crate) fn keys(&self) -> impl Iterator<Item = &'a str> + use<'a> {
         let keys = self.keys;
         self.offsets.clone().map(move |idx| keys.value(idx))
+    }
+
+    /// Iterates over non-null entries in storage order.
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (&'a str, &'a str)> + use<'a> {
+        let (keys, values) = (self.keys, self.values);
+        self.offsets
+            .clone()
+            .filter(move |&index| values.is_valid(index))
+            .map(move |index| (keys.value(index), values.value(index)))
     }
 
     pub fn materialize(&self) -> HashMap<String, String> {
@@ -749,9 +768,10 @@ mod tests {
         // Should return an error
         assert!(result.is_err());
         if let Err(e) = result {
-            assert!(e
-                .to_string()
-                .contains("Selection vector is larger than data length"));
+            assert!(
+                e.to_string()
+                    .contains("Selection vector is larger than data length")
+            );
             assert!(e.to_string().contains("3 > 2"));
         }
     }

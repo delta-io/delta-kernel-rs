@@ -2,8 +2,8 @@
 
 use url::Url;
 
-use super::search::Bound;
 use super::Timestamp;
+use super::search::Bound;
 use crate::Version;
 
 /// The nearest retained timestamp on the side of the search bound that an

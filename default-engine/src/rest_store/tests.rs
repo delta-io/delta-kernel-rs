@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{
@@ -7,8 +7,8 @@ use delta_kernel::object_store::{
     PutOptions, PutPayload, Result as ObjectStoreResult, UpdateVersion,
 };
 use futures::StreamExt as _;
-use reqwest::header::HeaderMap;
 use reqwest::Client;
+use reqwest::header::HeaderMap;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -476,9 +476,10 @@ async fn get_empty_bounded_range_is_invalid() {
         matches!(err, ObjectStoreError::Generic { .. }),
         "got {err:?}"
     );
-    assert!(err
-        .to_string()
-        .contains("Range started at 0 and ended at 0"));
+    assert!(
+        err.to_string()
+            .contains("Range started at 0 and ended at 0")
+    );
 }
 
 /// `list_with_offset` must exclude the offset entry itself even if the backend echoes it

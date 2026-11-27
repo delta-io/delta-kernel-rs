@@ -1,7 +1,7 @@
 //! In-memory implementation of [`UpdateTableClient`] for testing.
 
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::RwLock;
 
 use super::UpdateTableClient;
@@ -51,9 +51,9 @@ impl TableData {
             )));
         }
         if self.catalog_commits.len() >= Self::MAX_UNPUBLISHED_COMMITS {
-            return Err(Error::MaxUnpublishedCommitsExceeded(
+            return Err(Error::MaxUnpublishedCommitsExceeded(Some(
                 Self::MAX_UNPUBLISHED_COMMITS as u16,
-            ));
+            )));
         }
         if let Some(v) = backfilled {
             self.cleanup_published_commits(v);
@@ -296,7 +296,8 @@ mod tests {
             client
                 .update_table(&target(), commit_request(next_version, None))
                 .await,
-            Err(Error::MaxUnpublishedCommitsExceeded(_))
+            Err(Error::MaxUnpublishedCommitsExceeded(Some(max)))
+                if usize::from(max) == TableData::MAX_UNPUBLISHED_COMMITS
         ));
     }
 }

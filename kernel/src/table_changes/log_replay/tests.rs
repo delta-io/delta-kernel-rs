@@ -9,12 +9,12 @@ use test_utils::LoggingTest;
 use super::TableChangesScanMetadata;
 use crate::actions::{Add, Cdc, CommitInfo, Metadata, Protocol, Remove};
 use crate::engine::sync::SyncEngine;
-use crate::expressions::{col, lit, BinaryPredicateOp};
+use crate::expressions::expr;
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
-use crate::scan::state::DvInfo;
 use crate::scan::PhysicalPredicate;
-use crate::schema::{schema, schema_ref, DataType, SchemaRef, StructField};
+use crate::scan::state::DvInfo;
+use crate::schema::{DataType, SchemaRef, StructField, schema, schema_ref};
 use crate::table_changes::log_replay::LogReplayScanner;
 use crate::table_changes::test_utils::{
     replay_unmapped_unpartitioned_table_changes, row_tracking_metadata, row_tracking_table_config,
@@ -27,10 +27,10 @@ use crate::table_properties::{
     ENABLE_CHANGE_DATA_FEED, ENABLE_ROW_TRACKING, ROW_TRACKING_SUSPENDED,
 };
 use crate::unit_test_utils::{
-    assert_result_error_with_message, Action, LocalMockTable, MockProtocolBuilder,
-    MockTableConfigurationBuilder,
+    Action, LocalMockTable, MockProtocolBuilder, MockTableConfigurationBuilder,
+    assert_result_error_with_message,
 };
-use crate::{Engine, KernelError, KernelResult, KernelResultIterator, Predicate, Version};
+use crate::{Engine, Error, KernelError, KernelResult, Predicate, Result, Version};
 
 fn get_schema() -> SchemaRef {
     schema_ref! {
@@ -50,13 +50,17 @@ fn get_default_table_config(table_root: &url::Url) -> TableConfiguration {
         .build()
 }
 
-fn table_changes_action_iter(
+fn table_changes_action_iter<I>(
     engine: Arc<dyn Engine>,
     start_table_configuration: &TableConfiguration,
-    commit_files: impl IntoIterator<Item = ParsedLogPath, IntoIter: Send>,
+    commit_files: I,
     table_schema: SchemaRef,
     physical_predicate: Option<(crate::PredicateRef, SchemaRef)>,
-) -> KernelResult<impl KernelResultIterator<TableChangesScanMetadata>> {
+) -> Result<impl Iterator<Item = Result<TableChangesScanMetadata>> + Send + use<I>>
+where
+    I: IntoIterator<Item = ParsedLogPath>,
+    I::IntoIter: Send,
+{
     replay_unmapped_unpartitioned_table_changes(
         engine,
         start_table_configuration,
@@ -84,7 +88,7 @@ fn execute_row_tracking(
     engine: Arc<dyn Engine>,
     mock_table: &LocalMockTable,
     end_schema: SchemaRef,
-) -> KernelResult<Vec<TableChangesScanMetadata>> {
+) -> Result<Vec<TableChangesScanMetadata>> {
     let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)?.into_iter();
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = row_tracking_table_config(table_root_url, get_schema());
@@ -125,7 +129,7 @@ fn execute_table_changes(
     mock_table: &LocalMockTable,
     start_version: Version,
     end_version: Option<Version>,
-) -> KernelResult<Vec<TableChangesScanMetadata>> {
+) -> Result<Vec<TableChangesScanMetadata>> {
     let commits = get_segment(
         engine.as_ref(),
         mock_table.table_root(),
@@ -150,14 +154,20 @@ fn assert_midstream_failure(engine: Arc<dyn Engine>, mock_table: &LocalMockTable
     // Reading commits 0-1 should fail
     let res_v0_v1 = execute_table_changes(engine.clone(), mock_table, 0, Some(1));
     assert!(
-        matches!(res_v0_v1, Err(KernelError::ChangeDataFeedUnsupported(_))),
+        matches!(
+            res_v0_v1,
+            Err(Error::Kernel(KernelError::ChangeDataFeedUnsupported(_)))
+        ),
         "Reading versions 0-1 should fail"
     );
 
     // Reading just commit 1 should also fail
     let res_v1 = execute_table_changes(engine, mock_table, 1, Some(1));
     assert!(
-        matches!(res_v1, Err(KernelError::ChangeDataFeedUnsupported(_))),
+        matches!(
+            res_v1,
+            Err(Error::Kernel(KernelError::ChangeDataFeedUnsupported(_)))
+        ),
         "Reading version 1 alone should fail"
     );
 }
@@ -179,7 +189,7 @@ fn get_segment(
     Ok(log_segment.listed.ascending_commit_files)
 }
 
-fn result_to_sv(iter: impl KernelResultIterator<TableChangesScanMetadata>) -> Vec<bool> {
+fn result_to_sv(iter: impl Iterator<Item = Result<TableChangesScanMetadata>> + Send) -> Vec<bool> {
     iter.map_ok(|scan_metadata| scan_metadata.selection_vector.into_iter())
         .flatten_ok()
         .try_collect()
@@ -248,14 +258,14 @@ async fn cdf_not_enabled() {
 
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url);
-    let res: KernelResult<Vec<_>> =
+    let res: Result<Vec<_>> =
         table_changes_action_iter(engine, &table_config, commits, get_schema(), None)
             .unwrap()
             .try_collect();
 
     assert!(matches!(
         res,
-        Err(KernelError::ChangeDataFeedUnsupported(_))
+        Err(Error::Kernel(KernelError::ChangeDataFeedUnsupported(_)))
     ));
 }
 
@@ -286,14 +296,14 @@ async fn unsupported_reader_feature() {
 
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url);
-    let res: KernelResult<Vec<_>> =
+    let res: Result<Vec<_>> =
         table_changes_action_iter(engine, &table_config, commits, get_schema(), None)
             .unwrap()
             .try_collect();
 
     assert!(matches!(
         res,
-        Err(KernelError::ChangeDataFeedUnsupported(_))
+        Err(Error::Kernel(KernelError::ChangeDataFeedUnsupported(_)))
     ));
 }
 
@@ -364,7 +374,7 @@ async fn column_mapping_should_succeed() {
     let read_table_config =
         TableConfiguration::try_new(metadata, protocol, table_root_url, 0).unwrap();
     let read_configuration = TableChangesReadConfiguration::new(&read_table_config);
-    let res: KernelResult<Vec<_>> = super::table_changes_action_iter(
+    let res: Result<Vec<_>> = super::table_changes_action_iter(
         engine,
         &table_config,
         &read_configuration,
@@ -428,7 +438,12 @@ async fn row_tracking_unavailable_midstream_fails(#[case] properties: &[(&str, &
 
     let res = execute_row_tracking(engine, &mock_table, get_schema()).map(|_| ());
     assert!(
-        matches!(&res, Err(KernelError::RowTrackingChangeFeedUnsupported(1))),
+        matches!(
+            &res,
+            Err(Error::Kernel(
+                KernelError::RowTrackingChangeFeedUnsupported(1)
+            ))
+        ),
         "expected row tracking to be unavailable at version 1, got {res:?}"
     );
 }
@@ -482,7 +497,9 @@ async fn row_tracking_schema_compatibility(
         assert!(
             matches!(
                 &res,
-                Err(KernelError::ChangeDataFeedIncompatibleSchema(_, _))
+                Err(Error::Kernel(
+                    KernelError::ChangeDataFeedIncompatibleSchema(_, _)
+                ))
             ),
             "expected incompatible-schema error, got {res:?}"
         );
@@ -582,7 +599,7 @@ async fn row_tracking_protocol_failure_preserves_the_underlying_error() {
 
     let result = execute_row_tracking(engine, &mock_table, get_schema()).map(|_| ());
     assert!(
-        matches!(&result, Err(KernelError::Unsupported(_))),
+        matches!(&result, Err(Error::Kernel(KernelError::Unsupported(_)))),
         "expected the protocol support error, got {result:?}"
     );
 }
@@ -613,14 +630,16 @@ async fn incompatible_schemas_fail() {
 
         let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
         let table_config = get_default_table_config(&table_root_url);
-        let res: KernelResult<Vec<_>> =
+        let res: Result<Vec<_>> =
             table_changes_action_iter(engine, &table_config, commits, cdf_schema, None)
                 .unwrap()
                 .try_collect();
 
         assert!(matches!(
             res,
-            Err(KernelError::ChangeDataFeedIncompatibleSchema(_, _))
+            Err(Error::Kernel(
+                KernelError::ChangeDataFeedIncompatibleSchema(_, _)
+            ))
         ));
     }
 
@@ -684,7 +703,7 @@ async fn incompatible_schemas_fail() {
 async fn test_schema_evolution(
     initial_schema: SchemaRef,
     evolved_schema: SchemaRef,
-) -> KernelResult<Vec<TableChangesScanMetadata>> {
+) -> Result<Vec<TableChangesScanMetadata>> {
     let engine = Arc::new(SyncEngine::new());
     let mut mock_table = LocalMockTable::new();
 
@@ -748,7 +767,9 @@ async fn demonstration_schema_evolution_failures() {
     assert!(
         matches!(
             res,
-            Err(KernelError::ChangeDataFeedIncompatibleSchema(_, _))
+            Err(Error::Kernel(
+                KernelError::ChangeDataFeedIncompatibleSchema(_, _)
+            ))
         ),
         "Expected ChangeDataFeedIncompatibleSchema error for adding nullable column"
     );
@@ -768,7 +789,9 @@ async fn demonstration_schema_evolution_failures() {
     assert!(
         matches!(
             res,
-            Err(KernelError::ChangeDataFeedIncompatibleSchema(_, _))
+            Err(Error::Kernel(
+                KernelError::ChangeDataFeedIncompatibleSchema(_, _)
+            ))
         ),
         "Expected ChangeDataFeedIncompatibleSchema error for type widening"
     );
@@ -788,7 +811,9 @@ async fn demonstration_schema_evolution_failures() {
     assert!(
         matches!(
             res,
-            Err(KernelError::ChangeDataFeedIncompatibleSchema(_, _))
+            Err(Error::Kernel(
+                KernelError::ChangeDataFeedIncompatibleSchema(_, _)
+            ))
         ),
         "Expected ChangeDataFeedIncompatibleSchema error for nullability change"
     );
@@ -1032,7 +1057,7 @@ async fn data_skipping_filter() {
         .await;
 
     // Look for actions with id > 4
-    let predicate = Predicate::binary(BinaryPredicateOp::GreaterThan, col!("id"), lit(4));
+    let predicate = Predicate::from_expr(expr!(col("id") > 4));
     let logical_schema = get_schema();
     let predicate =
         match PhysicalPredicate::try_new(&predicate, &logical_schema, ColumnMappingMode::None) {
@@ -1105,7 +1130,7 @@ async fn data_skipping_filter_prunes_partition_values_but_keeps_removes() {
         .with_table_root(table_root_url)
         .build();
 
-    let predicate = Predicate::binary(BinaryPredicateOp::Equal, col!("part"), lit("x"));
+    let predicate = Predicate::from_expr(expr!(col("part") == "x"));
     let predicate =
         match PhysicalPredicate::try_new(&predicate, &logical_schema, ColumnMappingMode::None) {
             Ok(PhysicalPredicate::Some(p, s)) => Some((p, s)),
@@ -1161,7 +1186,7 @@ async fn data_skipping_filter_prunes_stats_but_keeps_removes() {
         .await;
 
     let logical_schema = get_schema();
-    let predicate = Predicate::binary(BinaryPredicateOp::GreaterThan, col!("id"), lit(4));
+    let predicate = Predicate::from_expr(expr!(col("id") > 4));
     let predicate =
         match PhysicalPredicate::try_new(&predicate, &logical_schema, ColumnMappingMode::None) {
             Ok(PhysicalPredicate::Some(p, s)) => Some((p, s)),
@@ -1211,7 +1236,7 @@ async fn failing_protocol() {
 
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url);
-    let res: KernelResult<Vec<_>> =
+    let res: Result<Vec<_>> =
         table_changes_action_iter(engine, &table_config, commits, get_schema(), None)
             .unwrap()
             .try_collect();
@@ -1298,7 +1323,7 @@ async fn print_table_configuration() {
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url);
 
-    let _scan_batches: KernelResult<Vec<_>> =
+    let _scan_batches: Result<Vec<_>> =
         table_changes_action_iter(engine, &table_config, commits, get_schema(), None)
             .unwrap()
             .try_collect();
@@ -1363,7 +1388,7 @@ async fn print_table_info_post_phase1() {
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url);
 
-    let _scan_batches: KernelResult<Vec<_>> =
+    let _scan_batches: Result<Vec<_>> =
         table_changes_action_iter(engine, &table_config, commits, get_schema(), None)
             .unwrap()
             .try_collect();
@@ -1407,7 +1432,7 @@ async fn print_table_info_post_phase1_has_cdc() {
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url);
 
-    let _scan_batches: KernelResult<Vec<_>> =
+    let _scan_batches: Result<Vec<_>> =
         table_changes_action_iter(engine, &table_config, commits, get_schema(), None)
             .unwrap()
             .try_collect();
@@ -1462,7 +1487,7 @@ async fn print_table_info_post_phase1_has_dv() {
 
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url);
-    let _scan_batches: KernelResult<Vec<_>> =
+    let _scan_batches: Result<Vec<_>> =
         table_changes_action_iter(engine, &table_config, commits, get_schema(), None)
             .unwrap()
             .try_collect();

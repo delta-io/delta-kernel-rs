@@ -7,13 +7,13 @@
 
 use std::sync::LazyLock;
 
+use crate::KernelResult;
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::error::KernelError;
-use crate::expressions::{column_name, ColumnName};
+use crate::expressions::{ColumnName, column_name};
 use crate::schema::{ColumnNamesAndTypes, DataType, DecimalType, PrimitiveType};
 use crate::utils::require;
-use crate::KernelResult;
 
 /// Verifies that add file statistics contain required columns.
 ///
@@ -110,7 +110,7 @@ impl ColumnStatsValidator {
 }
 
 /// Build a stat column path: `stats.{category}.{column_path}`.
-fn build_stat_path(column: &ColumnName, category: &str) -> ColumnName {
+pub(super) fn build_stat_path(column: &ColumnName, category: &str) -> ColumnName {
     let mut path = vec!["stats".to_string(), category.to_string()];
     path.extend(column.iter().map(|s| s.to_string()));
     ColumnName::new(path)
@@ -181,7 +181,7 @@ static NUM_RECORDS_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
 });
 
 /// Select the predefined static type array for a given column data type.
-fn column_types_for(dt: &DataType) -> KernelResult<&'static ColumnNamesAndTypes> {
+pub(super) fn column_types_for(dt: &DataType) -> KernelResult<&'static ColumnNamesAndTypes> {
     match dt {
         #[cfg(feature = "udt-in-dev")]
         DataType::UserDefined(_) => Err(KernelError::unsupported("UDT min/max statistics")),
@@ -198,11 +198,11 @@ fn column_types_for(dt: &DataType) -> KernelResult<&'static ColumnNamesAndTypes>
         &DataType::TIMESTAMP => Ok(&COL_TYPES_TIMESTAMP),
         &DataType::TIMESTAMP_NTZ => Ok(&COL_TYPES_TIMESTAMP_NTZ),
         DataType::Primitive(PrimitiveType::Decimal(_)) => Ok(&COL_TYPES_DECIMAL),
-        &DataType::INTERVAL_YEAR_MONTH | &DataType::INTERVAL_DAY_TIME => {
-            Err(KernelError::unsupported(format!(
-                "Interval types are not supported for stats validation: {dt}"
-            )))
-        }
+        DataType::Primitive(
+            PrimitiveType::IntervalYearMonth(_) | PrimitiveType::IntervalDayTime(_),
+        ) => Err(KernelError::unsupported(format!(
+            "Interval types are not supported for stats validation: {dt}"
+        ))),
         #[cfg(feature = "geo-type-in-dev")]
         DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)) => Err(
             KernelError::unsupported(format!("Unsupported data type for stats validation: {dt}")),
@@ -244,11 +244,11 @@ fn is_stat_present<'b>(
         DataType::Primitive(PrimitiveType::Decimal(_)) => {
             Ok(getter.get_decimal(row_idx, field_name)?.is_some())
         }
-        &DataType::INTERVAL_YEAR_MONTH | &DataType::INTERVAL_DAY_TIME => {
-            Err(KernelError::unsupported(format!(
-                "Interval types are not supported for stats presence check: {data_type}"
-            )))
-        }
+        DataType::Primitive(
+            PrimitiveType::IntervalYearMonth(_) | PrimitiveType::IntervalDayTime(_),
+        ) => Err(KernelError::unsupported(format!(
+            "Interval types are not supported for stats presence check: {data_type}"
+        ))),
         #[cfg(feature = "geo-type-in-dev")]
         DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)) => {
             Err(KernelError::unsupported(format!(

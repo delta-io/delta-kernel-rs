@@ -5,8 +5,8 @@
 
 use std::sync::Arc;
 
-use crate::metrics::events::emit_parquet_read_completed;
 use crate::metrics::PrecountedMetricsIterator;
+use crate::metrics::events::emit_parquet_read_completed;
 use crate::schema::SchemaRef;
 use crate::{
     CancellationTokenRef, EngineData, FileDataReadResultIterator, FileMeta, FileSize, KernelResult,
@@ -115,7 +115,7 @@ mod tests {
     use super::*;
     use crate::metrics::MetricEvent;
     use crate::schema::schema_ref;
-    use crate::unit_test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
+    use crate::unit_test_utils::{CapturingReporter, install_thread_local_metrics_reporter};
 
     #[derive(Debug, Default)]
     struct StubParquetHandler {

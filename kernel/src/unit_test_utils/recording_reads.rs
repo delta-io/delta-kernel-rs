@@ -1,13 +1,14 @@
-//! Recording handlers for cancellation tests across adapter and snapshot read paths.
+//! Recording handlers for tests across adapter and snapshot read paths.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use bytes::Bytes;
 use url::Url;
 
 use super::TestCancellationToken;
+use crate::engine::DelegatingEngine;
 use crate::engine::sync::SyncEngine;
-use crate::engine::test_delegating::DelegatingEngine;
 use crate::{
     CancellationTokenRef, Engine, EngineData, FileDataReadResultIterator, FileMeta, FileSize,
     FileSlice, FilteredEngineData, JsonHandler, KernelError, KernelResult, KernelResultIterator,
@@ -25,7 +26,7 @@ pub(crate) enum Read {
     Footer,
 }
 
-/// Records scopes at the real engine's read boundaries; all data comes from the inner handlers.
+/// Records read scopes, with optional byte-read overrides and JSON stream transforms.
 pub(crate) struct RecordingReads {
     /// Engine supplying fixture data and delegated operations.
     pub(crate) inner: Arc<dyn Engine>,
@@ -35,11 +36,24 @@ pub(crate) struct RecordingReads {
     pub(crate) expected_token: Option<CancellationTokenRef>,
     /// Read boundary that triggers cancellation, when configured.
     pub(crate) cancel_on: Option<Read>,
+    /// Time spent at the read boundary before triggering cancellation.
+    pub(crate) cancel_delay: Duration,
     /// Cancels the test token after each JSON iterator item.
     pub(crate) cancel_json_after_batch: bool,
+    /// Overrides byte reads after recording; only valid for reads without a cancellation token.
+    pub(crate) override_byte_reads: Option<Box<ByteReadOverride>>,
+    /// Transforms the delegated JSON stream, for example to inject empty batches or errors.
+    pub(crate) transform_json_batches: Option<Box<JsonBatchTransform>>,
     /// Read boundaries observed in call order.
     pub(crate) events: Mutex<Vec<Read>>,
 }
+
+type ByteReadOverride =
+    dyn Fn(Vec<FileSlice>) -> KernelResult<Box<dyn KernelResultIterator<Bytes>>> + Send + Sync;
+
+type JsonBatchTransform = dyn Fn(SchemaRef, FileDataReadResultIterator) -> KernelResult<FileDataReadResultIterator>
+    + Send
+    + Sync;
 
 impl RecordingReads {
     /// Creates a recorder that can cancel at a selected read boundary.
@@ -50,7 +64,10 @@ impl RecordingReads {
             expected_token: Some(token.clone()),
             token,
             cancel_on,
+            cancel_delay: Duration::ZERO,
             cancel_json_after_batch: false,
+            override_byte_reads: None,
+            transform_json_batches: None,
             events: Mutex::new(Vec::new()),
         })
     }
@@ -75,6 +92,7 @@ impl RecordingReads {
         }
         self.events.lock().unwrap().push(read);
         if self.cancel_on == Some(read) {
+            std::thread::sleep(self.cancel_delay);
             self.token.cancel();
             if token.is_none() {
                 return Err(KernelError::Cancelled);
@@ -99,8 +117,8 @@ macro_rules! plain_reads {
 
 impl StorageHandler for RecordingReads {
     plain_reads! {
-        /// Records an unscoped listing request.
-        fn list_from, list_from_with_cancellation(path: &Url)
+        /// Records a listing request.
+        fn list_from, list_from_with_cancellation(path: &Url, end: Option<&Url>)
             -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>>;
 
         /// Records an unscoped byte-range read.
@@ -111,12 +129,13 @@ impl StorageHandler for RecordingReads {
     fn list_from_with_cancellation(
         &self,
         path: &Url,
+        end: Option<&Url>,
         token: Option<CancellationTokenRef>,
     ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
         self.record(Read::List, &token)?;
         self.inner
             .storage_handler()
-            .list_from_with_cancellation(path, token)
+            .list_from_with_cancellation(path, end, token)
     }
 
     fn read_files_with_cancellation(
@@ -130,6 +149,13 @@ impl StorageHandler for RecordingReads {
             Read::Hint
         };
         self.record(read, &token)?;
+        if let Some(read) = &self.override_byte_reads {
+            assert!(
+                token.is_none(),
+                "byte-read overrides require an unscoped read"
+            );
+            return read(files);
+        }
         self.inner
             .storage_handler()
             .read_files_with_cancellation(files, token)
@@ -173,7 +199,11 @@ impl JsonHandler for RecordingReads {
         let batches = self
             .inner
             .json_handler()
-            .read_json_files_with_cancellation(files, schema, predicate, token)?;
+            .read_json_files_with_cancellation(files, schema.clone(), predicate, token)?;
+        let batches = match &self.transform_json_batches {
+            Some(transform) => transform(schema, batches)?,
+            None => batches,
+        };
         if self.cancel_json_after_batch {
             let token = self.token.clone();
             Ok(Box::new(batches.inspect(move |_| token.cancel())))

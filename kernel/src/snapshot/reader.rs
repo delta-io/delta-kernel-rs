@@ -1,0 +1,315 @@
+//! Access to snapshot metadata that may require storage reads.
+
+use std::collections::HashSet;
+#[cfg(feature = "declarative-plans")]
+use std::sync::Arc;
+
+use delta_kernel_derive::internal_api;
+
+use super::Snapshot;
+use crate::actions::DomainMetadata;
+#[cfg(feature = "declarative-plans")]
+use crate::checkpoint::{CheckpointInfo, SelectedCheckpointType};
+use crate::clustering::ClusteringColumnInfo;
+use crate::engine::CancellableEngine;
+use crate::expressions::ColumnName;
+use crate::log_segment::DomainMetadataMap;
+use crate::{CancellationTokenRef, Engine, KernelResult};
+
+/// Reads snapshot metadata with an optional cancellation token.
+///
+/// Use [`Snapshot::reader`] for domain metadata, clustering columns, application transactions,
+/// row-tracking metadata, and commit timestamps. These getters may read storage when the required
+/// metadata is not cached in the snapshot. In-memory getters such as [`Snapshot::schema`] and
+/// [`Snapshot::version`] remain on the snapshot.
+///
+/// Getters run synchronously and may block on I/O. By default, they use the supplied engine's
+/// normal cancellation and timeout behavior. [`Self::with_cancellation_token`] adds cooperative
+/// cancellation to handler-backed reads; it does not make the getters asynchronous. Cached
+/// results can be returned without checking the token, and interrupting in-flight I/O depends
+/// on the engine. Creating or configuring a reader does not issue I/O.
+///
+/// The reader borrows its snapshot and retains no engine. The snapshot retains neither the reader
+/// nor its token, so callers can use different readers on the same snapshot.
+///
+/// ```no_run
+/// # use delta_kernel::{CancellationTokenRef, Engine, KernelResult, Snapshot};
+/// # fn read_metadata(
+/// #     snapshot: &Snapshot,
+/// #     engine: &dyn Engine,
+/// #     token: CancellationTokenRef,
+/// # ) -> KernelResult<()> {
+/// // Read synchronously with the engine's normal behavior.
+/// let domain = snapshot.reader().get_domain_metadata("my-domain", engine)?;
+/// // Share an operation's cancellation scope across related metadata reads.
+/// let reader = snapshot.reader().with_cancellation_token(token);
+/// let version = reader.get_app_id_version("my-app", engine)?;
+/// let timestamp = reader.get_timestamp(engine)?;
+/// # Ok(())
+/// # }
+/// ```
+pub struct SnapshotReader<'a> {
+    /// Immutable table state shared independently of this read scope.
+    snapshot: &'a Snapshot,
+    /// Optional token bound to each getter's handler-backed reads.
+    cancellation_token: Option<CancellationTokenRef>,
+}
+
+#[cfg(test)]
+mod tests;
+
+impl<'a> SnapshotReader<'a> {
+    /// Returns the selected checkpoint's V1 or V2 specification, or `None` if none was selected.
+    ///
+    /// UUID-named checkpoints follow the V2 spec, multi-part checkpoints the V1 spec, and a
+    /// classic-named checkpoint on a table without the v2Checkpoint feature the V1 spec. These
+    /// return without I/O, as does a type already read by discovery or supplied by a snapshot hint
+    /// or the checkpoint writer. Otherwise the type is resolved through
+    /// [`Self::get_checkpoint_info`], sharing that getter's I/O, caching, and cancellation
+    /// behavior: a classic-named checkpoint follows the V2 spec when it has a `checkpointMetadata`
+    /// action.
+    ///
+    /// The naming and protocol rules use the snapshot's protocol, so a V2 checkpoint written before
+    /// the table dropped the v2Checkpoint feature reports V1 until discovery reads it. A type from
+    /// a snapshot hint or the writer is not checked against the checkpoint until it is read.
+    /// Adaptive-metadata tables are unsupported.
+    #[cfg(feature = "declarative-plans")]
+    pub fn get_checkpoint_type(
+        &self,
+        engine: &dyn Engine,
+    ) -> KernelResult<Option<SelectedCheckpointType>> {
+        self.ensure_checkpoint_info_supported()?;
+        if let Some(checkpoint_type) = self.snapshot.known_checkpoint_type() {
+            return Ok(Some(checkpoint_type));
+        }
+        self.get_checkpoint_info(engine)
+            .map(|info| info.map(|info| info.checkpoint_type()))
+    }
+
+    /// Returns metadata for the selected checkpoint, or `None` when no checkpoint was selected.
+    ///
+    /// The returned info has a resolved V1/V2 type, kind, leaf schema, leaf count, exact byte
+    /// total, and portable hint. In that hint, the action count is -1 when unknown; the root
+    /// schema and bounded action lists may be absent. The derived hint has no checksum. Only
+    /// UUID-named checkpoints carry `v2Checkpoint`, even when a classic-named checkpoint
+    /// references sidecars. The portable hint contains no resolved layout and does not
+    /// establish complete metadata when deserialized.
+    ///
+    /// The first getter or scan that needs checkpoint metadata resolves the complete leaf schema
+    /// and sidecar list through the engine's plan executor. Successful results are shared by all
+    /// readers and scan planning; failures are retried on the next call. Construction and hint
+    /// export do not trigger this read. Reloads and updates that replace the log segment resolve
+    /// independently. Concurrent callers wait for in-progress initialization. Neither that wait
+    /// nor executor reads observe this reader's cancellation token; reads use the executor's own
+    /// cancellation behavior. During initialization, the plan executor must not request checkpoint
+    /// metadata recursively on the same snapshot, including through scan planning: the recursive
+    /// call would wait for the initialization already in progress.
+    /// Adaptive-metadata tables are unsupported.
+    #[cfg(feature = "declarative-plans")]
+    pub fn get_checkpoint_info(
+        &self,
+        engine: &dyn Engine,
+    ) -> KernelResult<Option<Arc<CheckpointInfo>>> {
+        self.ensure_checkpoint_info_supported()?;
+        self.read(engine, |snapshot, engine| snapshot.checkpoint_info(engine))
+    }
+
+    /// Sets the cancellation token for this reader's handler-backed reads.
+    ///
+    /// Each call replaces the reader's token binding. Passing `None` clears an existing binding.
+    ///
+    /// Reads return [`crate::KernelError::Cancelled`] when the engine observes cancellation.
+    /// The original token is forwarded unchanged, and getters remain synchronous. This does not
+    /// affect snapshot construction, scans, or other readers created from the same snapshot.
+    ///
+    /// This token is passed as the per-call token to cancellation-aware handlers; the engine
+    /// decides how it combines with its own cancellation.
+    pub fn with_cancellation_token(
+        mut self,
+        token: impl Into<Option<CancellationTokenRef>>,
+    ) -> Self {
+        self.cancellation_token = token.into();
+        self
+    }
+
+    /// Returns the latest non-expired transaction version for `application_id`.
+    ///
+    /// Returns `None` if no transaction exists for the application or its latest transaction has
+    /// expired under `delta.setTransactionRetentionDuration`.
+    ///
+    /// Uses an at-version CRC when it can answer the query. Otherwise, uses `engine` to scan only
+    /// commits after a stale CRC with complete transaction state, skipping the checkpoint, or to
+    /// replay the full log when no such CRC is available.
+    ///
+    /// Reports `SetTransactionLoadSuccess` or `SetTransactionLoadFailure`. Returns read,
+    /// retention-property, or cancellation errors.
+    pub fn get_app_id_version(
+        &self,
+        application_id: &str,
+        engine: &dyn Engine,
+    ) -> KernelResult<Option<i64>> {
+        self.read(engine, |snapshot, engine| {
+            snapshot.get_app_id_version(application_id, engine)
+        })
+    }
+
+    /// Returns the latest configuration for the user-controlled `domain`, or `None` if absent.
+    ///
+    /// Uses `engine` to replay the log when needed. Returns an error for system-controlled
+    /// `delta.*` domains, read failures, or cancellation.
+    pub fn get_domain_metadata(
+        &self,
+        domain: &str,
+        engine: &dyn Engine,
+    ) -> KernelResult<Option<String>> {
+        self.read(engine, |snapshot, engine| {
+            snapshot.get_domain_metadata(domain, engine)
+        })
+    }
+
+    /// Returns the row-tracking high-water mark, or `None` if no active row-tracking domain exists.
+    ///
+    /// Uses `engine` to load domain metadata when needed. Returns read, malformed-configuration,
+    /// or cancellation errors. [`crate::ROW_TRACKING_INITIAL_HIGH_WATER_MARK`] indicates that no
+    /// row IDs have been assigned yet.
+    pub fn get_row_tracking_high_water_mark(
+        &self,
+        engine: &dyn Engine,
+    ) -> KernelResult<Option<i64>> {
+        self.read(engine, Snapshot::get_row_tracking_high_water_mark)
+    }
+
+    /// Returns this version's timestamp in milliseconds since the Unix epoch.
+    ///
+    /// Uses the In-Commit Timestamp (ICT) when enabled, reading commit JSON through `engine` if
+    /// needed; otherwise returns the retained commit-file modification time. Returns missing
+    /// commit, invalid ICT configuration, read, or cancellation errors.
+    pub fn get_timestamp(&self, engine: &dyn Engine) -> KernelResult<i64> {
+        self.read(engine, Snapshot::get_timestamp)
+    }
+
+    /// Returns clustering descriptors in domain order.
+    ///
+    /// Returns `None` when the clustering feature is absent or `delta.clustering` has no active
+    /// entry. Each descriptor contains the physical name, logical name, and type. Uses `engine` to
+    /// load domain metadata when needed. Returns malformed-metadata, column-resolution, read, or
+    /// cancellation errors. An empty vector means the clustering domain names no columns.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    #[internal_api]
+    pub(crate) fn get_clustering_column_infos(
+        &self,
+        engine: &dyn Engine,
+    ) -> KernelResult<Option<Vec<ClusteringColumnInfo>>> {
+        self.read(engine, Snapshot::get_clustering_column_infos)
+    }
+
+    /// Returns physical clustering column names in domain order.
+    ///
+    /// Returns `None` when the clustering feature is absent or `delta.clustering` has no active
+    /// entry. Uses `engine` to load domain metadata when needed and preserves column mapping.
+    /// Returns malformed-metadata, read, or cancellation errors. An empty vector means the
+    /// clustering domain names no columns.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    #[internal_api]
+    pub(crate) fn get_physical_clustering_columns(
+        &self,
+        engine: &dyn Engine,
+    ) -> KernelResult<Option<Vec<ColumnName>>> {
+        self.read(engine, Snapshot::get_physical_clustering_columns)
+    }
+
+    /// Returns current metadata for `domains`, or all domains when the filter is `None`.
+    ///
+    /// Includes system-controlled domains and excludes removed entries. Uses an at-version CRC
+    /// with complete domain state, or a partial CRC containing every domain in an explicit filter.
+    /// Otherwise, uses `engine` to scan commits after a stale CRC with complete domain state and
+    /// reconcile them against its map, skipping the checkpoint, or replays the full log when no
+    /// such CRC is available.
+    ///
+    /// Reports `DomainMetadataLoadSuccess` or `DomainMetadataLoadFailure`. Returns read or
+    /// cancellation errors.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    #[internal_api]
+    pub(crate) fn get_domain_metadatas_internal(
+        &self,
+        engine: &dyn Engine,
+        domains: Option<&HashSet<&str>>,
+    ) -> KernelResult<DomainMetadataMap> {
+        self.read(engine, |snapshot, engine| {
+            snapshot.get_domain_metadatas_internal(engine, domains)
+        })
+    }
+
+    /// Returns the latest configuration for a user or system `domain`, or `None` if absent.
+    ///
+    /// Unlike [`Self::get_domain_metadata`], accepts `delta.*` domains. Uses `engine` to replay
+    /// the log when needed and returns read or cancellation errors.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    #[internal_api]
+    pub(crate) fn get_domain_metadata_internal(
+        &self,
+        domain: &str,
+        engine: &dyn Engine,
+    ) -> KernelResult<Option<String>> {
+        self.read(engine, |snapshot, engine| {
+            snapshot.get_domain_metadata_internal(domain, engine)
+        })
+    }
+
+    /// Returns all active user-controlled domain metadata, excluding `delta.*` domains.
+    ///
+    /// Uses `engine` to replay the log when needed and returns read or cancellation errors.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    #[internal_api]
+    pub(crate) fn get_all_domain_metadata(
+        &self,
+        engine: &dyn Engine,
+    ) -> KernelResult<Vec<DomainMetadata>> {
+        self.read(engine, Snapshot::get_all_domain_metadata)
+    }
+
+    /// Returns this version's In-Commit Timestamp (ICT), or `None` when ICT is disabled.
+    ///
+    /// Uses `engine` to read the commit when no at-version CRC is available. Returns missing
+    /// commit, invalid or missing ICT, read, or cancellation errors.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+    #[internal_api]
+    pub(crate) fn get_in_commit_timestamp(&self, engine: &dyn Engine) -> KernelResult<Option<i64>> {
+        self.read(engine, Snapshot::get_in_commit_timestamp)
+    }
+
+    /// Creates an unscoped metadata reader without issuing I/O.
+    pub(super) fn new(snapshot: &'a Snapshot) -> Self {
+        Self {
+            snapshot,
+            cancellation_token: None,
+        }
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    fn ensure_checkpoint_info_supported(&self) -> KernelResult<()> {
+        #[cfg(feature = "adaptive-metadata-in-dev")]
+        if self.snapshot.has_adaptive_metadata() {
+            return Err(crate::KernelError::unsupported(
+                "Checkpoint info does not support adaptive metadata",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Binds this reader's token for one getter while leaving the shared snapshot unchanged.
+    fn read<T>(
+        &self,
+        engine: &dyn Engine,
+        operation: impl FnOnce(&Snapshot, &dyn Engine) -> KernelResult<T>,
+    ) -> KernelResult<T> {
+        let scoped_engine = self
+            .cancellation_token
+            .as_ref()
+            .map(|token| CancellableEngine::new(engine, token.clone()));
+        let engine = scoped_engine
+            .as_ref()
+            .map_or(engine, |engine| engine as &dyn Engine);
+        operation(self.snapshot, engine)
+    }
+}

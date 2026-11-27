@@ -12,25 +12,34 @@ use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::expressions::{col, lit, ColumnName, Predicate, Scalar};
-use delta_kernel::object_store::local::LocalFileSystem;
+use delta_kernel::expressions::{ColumnName, Expression, Predicate, Scalar, expr};
+#[cfg(feature = "declarative-plans")]
+use delta_kernel::metrics::{MetricEvent, ReplayBase, ScanPlanOutcome};
 use delta_kernel::object_store::DynObjectStore;
+use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::parquet::arrow::ArrowWriter;
 use delta_kernel::scan::state::ScanFile;
-use delta_kernel::scan::PartitionValuesOptions;
-use delta_kernel::schema::{schema_ref, DataType, StructField};
-use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
+use delta_kernel::scan::{
+    AfterSequentialScanMetadata, ParallelScanMetadata, ParsedColumnSource, PartitionValuesOptions,
+    ScanMetadata, StatsOptions,
+};
+use delta_kernel::schema::{DataType, StructField, schema_ref};
+use delta_kernel::table_features::{ColumnMappingMode, get_any_level_column_physical_name};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{Engine, Snapshot, SnapshotRef};
 use rstest::rstest;
+#[cfg(feature = "declarative-plans")]
+use test_utils::CapturingReporter;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::table_builder::{
-    partitioned, unpartitioned, version_latest, FeatureSet, LogState, TableConfig, TestTableBuilder,
+    DataLayoutConfig, FeatureSet, LogState, TableConfig, TestTableBuilder, partitioned,
+    unpartitioned, version_latest,
 };
 use test_utils::{
-    add_commit, assert_result_error_with_message, create_default_engine_mt_executor, get_column,
-    install_thread_local_metrics_reporter, test_context, test_table_setup_mt, CountingReporter,
+    CountingReporter, add_commit, assert_result_error_with_message,
+    create_default_engine_mt_executor, get_column, install_thread_local_metrics_reporter,
+    test_context, test_table_setup_mt,
 };
 use url::Url;
 
@@ -145,6 +154,174 @@ fn scan_metadata_emits_partition_values_parsed_across_column_mapping(
     }
 
     assert_eq!(file_count, 1, "Should have processed exactly one file");
+}
+
+/// Returns `(source, has_partitionValues_parsed_column)` for every batch that has selected rows.
+fn batch_partition_values_sources<E: std::fmt::Debug>(
+    batches: impl IntoIterator<Item = Result<ScanMetadata, E>>,
+) -> Vec<(Option<ParsedColumnSource>, bool)> {
+    let mut sources = Vec::new();
+    for metadata in batches {
+        let metadata = metadata.unwrap();
+        let source = metadata.partition_values_source();
+        let (data, selection) = metadata.scan_files.into_parts();
+        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(data).unwrap().into();
+        let batch = filter_record_batch(&batch, &BooleanArray::from(selection)).unwrap();
+        if batch.num_rows() > 0 {
+            let has_column = batch.column_by_name("partitionValues_parsed").is_some();
+            sources.push((source, has_column));
+        }
+    }
+    sources
+}
+
+/// Asserts the batches report exactly the expected sources, each paired with a present column
+/// (or an absent one for `None`).
+fn assert_batch_sources(
+    actual: Vec<(Option<ParsedColumnSource>, bool)>,
+    expected: &[Option<ParsedColumnSource>],
+) {
+    for source in expected {
+        assert!(
+            actual.iter().any(|(s, _)| s == source),
+            "no batch reported {source:?}; got {actual:?}"
+        );
+    }
+    for (source, has_column) in &actual {
+        assert!(
+            expected.contains(source),
+            "unexpected source {source:?}; expected one of {expected:?}"
+        );
+        assert_eq!(
+            *has_column,
+            source.is_some(),
+            "column presence vs {source:?}"
+        );
+    }
+}
+
+#[rstest]
+#[case::json_only(1, None, false, &[Some(ParsedColumnSource::Derived)])]
+#[case::checkpoint_with_native(
+    1, Some(1), true, &[Some(ParsedColumnSource::Checkpoint)]
+)]
+#[case::checkpoint_without_native(1, Some(1), false, &[Some(ParsedColumnSource::Derived)])]
+#[case::checkpoint_then_commit(
+    2,
+    Some(1),
+    true,
+    &[Some(ParsedColumnSource::Checkpoint), Some(ParsedColumnSource::Derived)]
+)]
+fn scan_metadata_reports_partition_values_source(
+    #[case] latest_version: u64,
+    #[case] checkpoint_at: Option<u64>,
+    #[case] write_stats_as_struct: bool,
+    #[case] expected: &[Option<ParsedColumnSource>],
+) {
+    let (engine, snapshot, _table) = test_context!(
+        LogState::with_latest_version(latest_version).maybe_with_checkpoint_at(checkpoint_at),
+        FeatureSet::empty(),
+        partitioned(),
+        TableConfig::new().write_stats_as_struct(write_stats_as_struct),
+        version_latest(),
+    );
+    let scan = snapshot
+        .scan_builder()
+        .with_partition_values(PartitionValuesOptions::with_struct())
+        .build()
+        .unwrap();
+
+    assert_batch_sources(
+        batch_partition_values_sources(scan.scan_metadata(&engine).unwrap()),
+        expected,
+    );
+}
+
+#[rstest]
+#[case::predicate_only(
+    partitioned(),
+    false,
+    true,
+    false,
+    Some(ParsedColumnSource::Checkpoint)
+)]
+#[case::predicate_only_skip_stats(partitioned(), false, true, true, None)]
+#[case::struct_skip_stats(partitioned(), true, false, true, Some(ParsedColumnSource::Checkpoint))]
+#[case::no_struct_no_predicate(partitioned(), false, false, false, None)]
+#[case::unpartitioned_with_struct(unpartitioned(), true, false, false, None)]
+fn scan_metadata_partition_values_source_follows_emitted_column(
+    #[case] data_layout: DataLayoutConfig,
+    #[case] with_struct: bool,
+    #[case] with_partition_predicate: bool,
+    #[case] skip_stats: bool,
+    #[case] expected: Option<ParsedColumnSource>,
+) {
+    let (engine, snapshot, _table) = test_context!(
+        LogState::with_latest_version(1).with_checkpoint_at([1]),
+        FeatureSet::empty(),
+        data_layout,
+        TableConfig::new().write_stats_as_struct(true),
+        version_latest(),
+    );
+    let mut builder = snapshot.scan_builder();
+    if with_struct {
+        builder = builder.with_partition_values(PartitionValuesOptions::with_struct());
+    }
+    if with_partition_predicate {
+        builder = builder.with_predicate(Arc::new(Predicate::is_not_null(Expression::column([
+            "part_int",
+        ]))));
+    }
+    if skip_stats {
+        builder = builder.with_stats(StatsOptions::none());
+    }
+    let scan = builder.build().unwrap();
+
+    assert_batch_sources(
+        batch_partition_values_sources(scan.scan_metadata(&engine).unwrap()),
+        &[expected],
+    );
+}
+
+/// Parallel scan metadata derives `partitionValues_parsed` from the string map even when the
+/// checkpoint has a native column, in both the sequential and the parallel phase.
+#[test]
+fn parallel_scan_metadata_reports_derived_partition_values_source() {
+    let (engine, snapshot, _table) = test_context!(
+        LogState::with_latest_version(2)
+            .with_checkpoint_at([1])
+            .with_sidecars_if_enabled(Some(1)),
+        FeatureSet::new().v2_checkpoint(),
+        partitioned(),
+        TableConfig::new().write_stats_as_struct(true),
+        version_latest(),
+    );
+    let scan = snapshot
+        .scan_builder()
+        .with_partition_values(PartitionValuesOptions::with_struct())
+        .build()
+        .unwrap();
+    let engine = Arc::new(engine);
+    let mut sequential = scan.parallel_scan_metadata(engine.clone()).unwrap();
+
+    assert_batch_sources(
+        batch_partition_values_sources(sequential.by_ref()),
+        &[Some(ParsedColumnSource::Derived)],
+    );
+
+    let AfterSequentialScanMetadata::Parallel { state, files } = sequential.finish().unwrap()
+    else {
+        panic!("expected a parallel checkpoint phase");
+    };
+    assert!(!files.is_empty());
+    let parallel = ParallelScanMetadata::try_new(engine, Arc::from(state), files).unwrap();
+
+    // Checked separately so that a `Derived` commit batch from the sequential phase cannot
+    // satisfy the assertion for the sidecar batches.
+    assert_batch_sources(
+        batch_partition_values_sources(parallel),
+        &[Some(ParsedColumnSource::Derived)],
+    );
 }
 
 // === Foreign-writer literal empty-string partition values ===
@@ -360,30 +537,32 @@ async fn empty_string_partition_pruning(#[values(false, true)] native_checkpoint
 
     // The empty-string value is a real "", so equality and null predicates treat it as such.
     assert_eq!(
-        surviving(Predicate::eq(col!("p_str"), lit(""))),
+        surviving(Predicate::from_expr(expr!(col("p_str") == ""))),
         vec![empty.clone()],
         "empty-string file must be kept under p_str = ''"
     );
     assert_eq!(
-        surviving(Predicate::eq(col!("p_str"), lit("other"))),
+        surviving(Predicate::from_expr(expr!(col("p_str") == "other"))),
         vec![other.clone()],
         "empty-string file must be pruned under p_str = 'other'"
     );
     // Both partition values are non-null ("" and "other"), so IS NULL prunes both and IS NOT NULL
     // keeps both.
     assert!(
-        surviving(Predicate::is_null(col!("p_str"))).is_empty(),
+        surviving(Predicate::from_expr(expr!(is_null(col("p_str"))))).is_empty(),
         "no file has a null p_str, so IS NULL prunes both (the empty file's value is \"\", not null)"
     );
     assert_eq!(
-        surviving(Predicate::is_not_null(col!("p_str"))),
+        surviving(Predicate::from_expr(expr!(is_not_null(col("p_str"))))),
         both,
         "both files must be kept under p_str IS NOT NULL"
     );
 
     // The binary column reconstructs "" as empty bytes, pruned the same way.
     assert_eq!(
-        surviving(Predicate::eq(col!("p_bin"), lit(b"other".as_slice()))),
+        surviving(Predicate::from_expr(expr!(
+            col("p_bin") == lit(b"other".as_slice())
+        ))),
         vec![other.clone()],
         "empty-bytes file must be pruned under p_bin = X'6f74686572'"
     );
@@ -426,6 +605,16 @@ async fn empty_string_partition_pruning(#[values(false, true)] native_checkpoint
     "2024-03-10 02:30:00",
     "2024-03-10T10:30:00Z"
 )]
+#[case::hst_historical(Some("HST"), "1940-01-01 00:00:00", "1940-01-01T10:00:00Z")]
+#[case::mst_historical(Some("MST"), "1943-07-01 00:00:00", "1943-07-01T07:00:00Z")]
+#[case::est_historical(Some("EST"), "1900-01-01 00:00:00", "1900-01-01T05:00:00Z")]
+#[case::honolulu_historical(
+    Some("Pacific/Honolulu"),
+    "1940-01-01 00:00:00",
+    "1940-01-01T10:30:00Z"
+)]
+#[case::phoenix_historical(Some("America/Phoenix"), "1943-07-01 00:00:00", "1943-07-01T06:00:00Z")]
+#[case::panama_historical(Some("America/Panama"), "1900-01-01 00:00:00", "1900-01-01T05:19:36Z")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn offset_less_timestamp_partition_read_with_json_and_checkpoint(
     #[case] tz: Option<&str>,
@@ -490,11 +679,13 @@ async fn offset_less_timestamp_partition_read_with_json_and_checkpoint(
         .unwrap();
     let expected_ts = timestamp_micros(expected_ts);
     let mut paths = Vec::new();
+    let mut sources = Vec::new();
     for metadata in scan.scan_metadata(engine.as_ref()).unwrap() {
         let metadata = metadata.unwrap();
         if tz.is_some() {
             assert!(metadata.scan_file_transforms.iter().all(Option::is_none));
         }
+        let source = metadata.partition_values_source();
         let (data, selection) = metadata.scan_files.into_parts();
         let batch: RecordBatch = ArrowEngineData::try_from_engine_data(data).unwrap().into();
         let batch = filter_record_batch(&batch, &BooleanArray::from(selection)).unwrap();
@@ -524,16 +715,40 @@ async fn offset_less_timestamp_partition_read_with_json_and_checkpoint(
             );
             assert_eq!(integers.value(row), 7);
             paths.push(path.to_string());
+            sources.push((path.to_string(), source));
         }
     }
     paths.sort();
     assert_eq!(paths, ["file1.parquet", "file2.parquet"]);
+
+    // Each file reports the source of the batch it was read from. `file1` is in the checkpoint, so
+    // it reports `Checkpoint` only when the checkpoint has a native column. `file2` exists only in
+    // a JSON commit, which carries just the string map, so it is always `Derived`.
+    let checkpoint_source = if write_parsed_partition {
+        ParsedColumnSource::Checkpoint
+    } else {
+        ParsedColumnSource::Derived
+    };
+    sources.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        sources,
+        [
+            ("file1.parquet".to_string(), Some(checkpoint_source)),
+            (
+                "file2.parquet".to_string(),
+                Some(ParsedColumnSource::Derived)
+            ),
+        ]
+    );
 }
 
 #[rstest]
 #[case::utc_before(
-    col!("p_ts").lt(lit(Scalar::Timestamp(timestamp_micros("2024-01-15T16:00:00Z")))),
+    Predicate::from_expr(expr!(
+        col("p_ts") < lit(Scalar::Timestamp(timestamp_micros("2024-01-15T16:00:00Z")))
+    )),
     None,
+    ("2024-01-15 12:30:45.123456", "2024-01-15T18:30:45.123456Z"),
     &[
         ("offset-less-in-checkpoint.parquet", "2024-01-15T12:30:45.123456Z"),
         ("offset-less-in-json.parquet", "2024-01-15T12:30:45.123456Z"),
@@ -541,8 +756,11 @@ async fn offset_less_timestamp_partition_read_with_json_and_checkpoint(
     true /* write_parsed_partition */
 )]
 #[case::utc_after(
-    col!("p_ts").gt(lit(Scalar::Timestamp(timestamp_micros("2024-01-15T16:00:00Z")))),
+    Predicate::from_expr(expr!(
+        col("p_ts") > lit(Scalar::Timestamp(timestamp_micros("2024-01-15T16:00:00Z")))
+    )),
     None,
+    ("2024-01-15 12:30:45.123456", "2024-01-15T18:30:45.123456Z"),
     &[
         ("utc-in-checkpoint.parquet", "2024-01-15T18:30:45.123456Z"),
         ("utc-in-json.parquet", "2024-01-15T18:30:45.123456Z"),
@@ -550,14 +768,20 @@ async fn offset_less_timestamp_partition_read_with_json_and_checkpoint(
     true /* write_parsed_partition */
 )]
 #[case::los_angeles_before(
-    col!("p_ts").lt(lit(Scalar::Timestamp(timestamp_micros("2024-01-15T16:00:00Z")))),
+    Predicate::from_expr(expr!(
+        col("p_ts") < lit(Scalar::Timestamp(timestamp_micros("2024-01-15T16:00:00Z")))
+    )),
     Some("America/Los_Angeles"),
+    ("2024-01-15 12:30:45.123456", "2024-01-15T18:30:45.123456Z"),
     &[("offset-less-in-checkpoint.parquet", "2024-01-15T12:30:45.123456Z")],
     true /* write_parsed_partition */
 )]
 #[case::los_angeles_after(
-    col!("p_ts").gt(lit(Scalar::Timestamp(timestamp_micros("2024-01-15T16:00:00Z")))),
+    Predicate::from_expr(expr!(
+        col("p_ts") > lit(Scalar::Timestamp(timestamp_micros("2024-01-15T16:00:00Z")))
+    )),
     Some("America/Los_Angeles"),
+    ("2024-01-15 12:30:45.123456", "2024-01-15T18:30:45.123456Z"),
     &[
         ("offset-less-in-json.parquet", "2024-01-15T20:30:45.123456Z"),
         ("utc-in-checkpoint.parquet", "2024-01-15T18:30:45.123456Z"),
@@ -566,15 +790,55 @@ async fn offset_less_timestamp_partition_read_with_json_and_checkpoint(
     true /* write_parsed_partition */
 )]
 #[case::los_angeles_before_without_parsed(
-    col!("p_ts").lt(lit(Scalar::Timestamp(timestamp_micros("2024-01-15T16:00:00Z")))),
+    Predicate::from_expr(expr!(
+        col("p_ts") < lit(Scalar::Timestamp(timestamp_micros("2024-01-15T16:00:00Z")))
+    )),
     Some("America/Los_Angeles"),
+    ("2024-01-15 12:30:45.123456", "2024-01-15T18:30:45.123456Z"),
     &[],
+    false /* write_parsed_partition */
+)]
+#[case::hst_historical(
+    Predicate::from_expr(expr!(
+        col("p_ts") == lit(Scalar::Timestamp(timestamp_micros("1940-01-01T10:00:00Z")))
+    )),
+    Some("HST"),
+    ("1940-01-01 00:00:00", "1940-01-01T10:30:00Z"),
+    &[
+        ("offset-less-in-checkpoint.parquet", "1940-01-01T10:00:00Z"),
+        ("offset-less-in-json.parquet", "1940-01-01T10:00:00Z"),
+    ],
+    false /* write_parsed_partition */
+)]
+#[case::mst_historical(
+    Predicate::from_expr(expr!(
+        col("p_ts") == lit(Scalar::Timestamp(timestamp_micros("1943-07-01T07:00:00Z")))
+    )),
+    Some("MST"),
+    ("1943-07-01 00:00:00", "1943-07-01T06:00:00Z"),
+    &[
+        ("offset-less-in-checkpoint.parquet", "1943-07-01T07:00:00Z"),
+        ("offset-less-in-json.parquet", "1943-07-01T07:00:00Z"),
+    ],
+    false /* write_parsed_partition */
+)]
+#[case::est_historical(
+    Predicate::from_expr(expr!(
+        col("p_ts") == lit(Scalar::Timestamp(timestamp_micros("1900-01-01T05:00:00Z")))
+    )),
+    Some("EST"),
+    ("1900-01-01 00:00:00", "1900-01-01T05:19:36Z"),
+    &[
+        ("offset-less-in-checkpoint.parquet", "1900-01-01T05:00:00Z"),
+        ("offset-less-in-json.parquet", "1900-01-01T05:00:00Z"),
+    ],
     false /* write_parsed_partition */
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn offset_less_timestamp_partition_predicates_with_json_and_checkpoint(
     #[case] predicate: Predicate,
     #[case] tz: Option<&str>,
+    #[case] timestamps: (&str, &str),
     #[case] expected_files_and_timestamps: &[(&str, &str)],
     #[case] write_parsed_partition: bool,
     #[values(false, true)] parsed_struct_on_scan: bool,
@@ -593,11 +857,11 @@ async fn offset_less_timestamp_partition_predicates_with_json_and_checkpoint(
         &[
             TimestampPartitionFile {
                 filename: "offset-less-in-checkpoint.parquet",
-                timestamp: "2024-01-15 12:30:45.123456",
+                timestamp: timestamps.0,
             },
             TimestampPartitionFile {
                 filename: "utc-in-checkpoint.parquet",
-                timestamp: "2024-01-15T18:30:45.123456Z",
+                timestamp: timestamps.1,
             },
         ],
     )
@@ -612,11 +876,11 @@ async fn offset_less_timestamp_partition_predicates_with_json_and_checkpoint(
         &[
             TimestampPartitionFile {
                 filename: "offset-less-in-json.parquet",
-                timestamp: "2024-01-15 12:30:45.123456",
+                timestamp: timestamps.0,
             },
             TimestampPartitionFile {
                 filename: "utc-in-json.parquet",
-                timestamp: "2024-01-15T18:30:45.123456Z",
+                timestamp: timestamps.1,
             },
         ],
     )
@@ -722,14 +986,46 @@ fn different_scans_require_timezone_support_only_for_timestamp_partitions(
         .unwrap();
 
     #[cfg(feature = "declarative-plans")]
-    assert_result_error_with_message(
-        scan.declarative_metadata_scan_plan(engine.as_ref()),
-        if timestamp_partitioned {
-            "with_timestamp_timezone in declarative_metadata_scan_plan"
-        } else {
-            "this engine does not provide a PlanExecutor"
-        },
-    );
+    {
+        let reporter = Arc::new(CapturingReporter::default());
+        let guard = install_thread_local_metrics_reporter(reporter.clone());
+        let result = scan.declarative_metadata_scan_plan(engine.as_ref());
+        drop(guard);
+        assert_result_error_with_message(
+            result,
+            if timestamp_partitioned {
+                "with_timestamp_timezone in declarative_metadata_scan_plan"
+            } else {
+                "this engine does not provide a PlanExecutor"
+            },
+        );
+        let events: Vec<_> = reporter
+            .events()
+            .into_iter()
+            .filter(|event| matches!(event, MetricEvent::ScanPlanGenerationCompleted(_)))
+            .collect();
+        let [MetricEvent::ScanPlanGenerationCompleted(event)] = events.as_slice() else {
+            panic!("expected one scan-plan failure: {events:?}");
+        };
+        assert_eq!(event.outcome, ScanPlanOutcome::Error);
+        let report = &event.metadata_planning;
+        assert_eq!(report.stats, StatsOptions::default());
+        assert_eq!(report.partition_values.parsed_struct(), parsed_struct);
+        assert_eq!(report.partition_values.timestamp_timezone(), Some(tz));
+        assert!(!report.has_filter);
+        assert_eq!(
+            report.replay_base,
+            (!timestamp_partitioned).then_some(ReplayBase::Checkpoint)
+        );
+        assert_eq!(report.base_version, (!timestamp_partitioned).then_some(1));
+        assert_eq!(event.checkpoint.is_some(), !timestamp_partitioned);
+        if let Some(checkpoint) = &event.checkpoint {
+            assert!(checkpoint.duration_ns <= event.duration_ns);
+            assert_eq!(checkpoint.version, 1);
+            assert!(checkpoint.info.is_none());
+            assert!(checkpoint.source.is_none());
+        }
+    }
     let parallel_result = scan.parallel_scan_metadata(engine.clone());
     let execute_result = scan.execute(engine);
     if timestamp_partitioned {
@@ -859,7 +1155,7 @@ async fn timezone_aware_parsed_partition_values_report_invalid_input(
         .build();
     let error = match scan {
         Err(error) => error,
-        Ok(scan) => match scan.scan_metadata(engine.as_ref()) {
+        Ok(scan) => delta_kernel::Error::Kernel(match scan.scan_metadata(engine.as_ref()) {
             Err(error) => error,
             Ok(mut metadata) => {
                 let result = metadata.next().expect("one metadata result");
@@ -868,7 +1164,7 @@ async fn timezone_aware_parsed_partition_values_report_invalid_input(
                 };
                 error
             }
-        },
+        }),
     };
     assert!(error.to_string().contains(expected_error), "{error}");
 }

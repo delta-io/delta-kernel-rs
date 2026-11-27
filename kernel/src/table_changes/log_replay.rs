@@ -8,24 +8,25 @@ use std::sync::{Arc, LazyLock};
 use itertools::Itertools;
 use tracing::info;
 
-use crate::actions::visitors::{visit_deletion_vector_at, InCommitTimestampVisitor};
+use crate::actions::visitors::{InCommitTimestampVisitor, visit_deletion_vector_at};
 use crate::actions::{
-    Metadata, Protocol, ADD_FIELD, CDC_FIELD, COMMIT_INFO_NAME, METADATA_FIELD, PROTOCOL_FIELD,
+    ADD_FIELD, CDC_FIELD, COMMIT_INFO_NAME, METADATA_FIELD, Metadata, PROTOCOL_FIELD, Protocol,
     REMOVE_FIELD,
 };
 use crate::engine_data::{GetData, TypedGetData};
-use crate::expressions::{column_name, ColumnName, MapToStructOptions};
+use crate::expressions::{ColumnName, MapToStructOptions, column_name};
 use crate::path::{AsUrl, ParsedLogPath};
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::scan::state::DvInfo;
-use crate::schema::{schema_ref, ColumnNamesAndTypes, DataType, SchemaRef};
+use crate::schema::{ColumnNamesAndTypes, DataType, SchemaRef, schema_ref};
 use crate::table_changes::scan_file::{cdf_scan_row_expression, cdf_scan_row_schema};
 use crate::table_changes::{CdfMode, TableChangesReadConfiguration};
 use crate::table_configuration::TableConfiguration;
-use crate::table_features::{format_features, Operation, TableFeature};
+use crate::table_features::{Operation, TableFeature, format_features};
 use crate::utils::require;
 use crate::{
-    Engine, EngineData, KernelError, KernelResult, KernelResultIterator, PredicateRef, RowVisitor,
+    Engine, EngineData, Error, KernelError, KernelResult, KernelResultIterator, PredicateRef,
+    Result, RowVisitor,
 };
 
 #[cfg(test)]
@@ -54,14 +55,18 @@ pub(crate) struct TableChangesScanMetadata {
 /// [`CdfMode::ChangeDataFeed`] uses `AddCDCFile` actions because they contain changes recorded by
 /// the writer. [`CdfMode::RowTracking`] ignores those actions and reconstructs changes from the
 /// row lineage in `add` and `remove` actions.
-pub(crate) fn table_changes_action_iter(
+pub(crate) fn table_changes_action_iter<I>(
     engine: Arc<dyn Engine>,
     start_table_configuration: &TableConfiguration,
     read_configuration: &TableChangesReadConfiguration,
-    commit_files: impl IntoIterator<Item = ParsedLogPath, IntoIter: Send>,
+    commit_files: I,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
     mode: CdfMode,
-) -> KernelResult<impl KernelResultIterator<TableChangesScanMetadata>> {
+) -> Result<impl Iterator<Item = Result<TableChangesScanMetadata>> + Send + use<I>>
+where
+    I: IntoIterator<Item = ParsedLogPath>,
+    I::IntoIter: Send,
+{
     // Skip against the raw `{ add, remove, ... }` action batch: table_changes must resolve
     // deletion vector pairs before filtering, so unlike the scan path it operates on raw
     // batches with stats parsed from `add.stats` JSON.
@@ -81,7 +86,7 @@ pub(crate) fn table_changes_action_iter(
     let mut current_configuration = start_table_configuration.clone();
     let result = commit_files
         .into_iter()
-        .map(move |commit_file| -> KernelResult<_> {
+        .map(move |commit_file| -> Result<_> {
             let scanner = LogReplayScanner::try_new(
                 engine.as_ref(),
                 &mut current_configuration,
@@ -89,10 +94,10 @@ pub(crate) fn table_changes_action_iter(
                 &read_configuration,
                 mode,
             )?;
-            scanner.into_scan_batches(engine.clone(), filter.clone())
+            Ok(scanner.into_scan_batches(engine.clone(), filter.clone())?)
         }) //Iterator-Result-Iterator-Result
         .flatten_ok() // Iterator-Result-Result
-        .map(|x| x?); // Iterator-Result
+        .map(|x| x?.map_err(Error::from)); // Iterator-Result
     Ok(result)
 }
 
@@ -164,8 +169,8 @@ impl LogReplayScanner {
         commit_file: ParsedLogPath,
         read_configuration: &TableChangesReadConfiguration,
         mode: CdfMode,
-    ) -> KernelResult<Self> {
-        let table_schema = read_configuration.schema();
+    ) -> Result<Self> {
+        let read_schema = read_configuration.schema();
         let visitor_schema = PreparePhaseVisitor::schema();
 
         // Note: We do not perform data skipping yet because we need to visit all add and
@@ -225,8 +230,7 @@ impl LogReplayScanner {
                 let writer_features_str = table_configuration
                     .protocol()
                     .writer_features()
-                    .map(format_features)
-                    .unwrap_or_else(|| "[]".to_string());
+                    .map_or_else(|| "[]".to_string(), format_features);
 
                 info!(
                     version = commit_file.version,
@@ -239,32 +243,46 @@ impl LogReplayScanner {
                     configuration = ?table_configuration.metadata().configuration(),
                     "Table configuration updated during CDF query"
                 );
-                // Compatibility is evaluated against the end version's logical schema.
+                let candidate_schema = table_configuration.logical_schema_ref();
                 require!(
-                    mode.schemas_compatible(
-                        table_configuration.logical_schema_ref().as_ref(),
-                        table_schema.as_ref()
-                    ),
-                    KernelError::change_data_feed_incompatible_schema_at_version(
-                        table_schema,
-                        table_configuration.logical_schema_ref().as_ref(),
-                        commit_file.version
+                    mode.schemas_compatible(candidate_schema, read_schema),
+                    Error::Kernel(
+                        KernelError::change_data_feed_incompatible_schema_at_version(
+                            read_schema,
+                            candidate_schema,
+                            commit_file.version
+                        )
                     )
                 );
                 read_configuration.ensure_partition_columns_compatible(
                     table_configuration,
                     commit_file.version,
                 )?;
+            }
+
+            if has_metadata_update {
                 require!(
                     table_configuration.is_feature_enabled(&mode.required_feature()),
-                    mode.feature_disabled_error(commit_file.version)
+                    Error::Kernel(mode.feature_disabled_error(commit_file.version))
                 );
             }
 
             if has_protocol_update {
                 table_configuration
                     .ensure_operation_supported(Operation::Cdf)
-                    .map_err(|e| mode.protocol_support_error(e, commit_file.version))?;
+                    .map_err(|e| match e {
+                        Error::Kernel(e) => {
+                            mode.protocol_support_error(e, commit_file.version).into()
+                        }
+                        other => other,
+                    })?;
+            }
+
+            if has_protocol_update && !has_metadata_update {
+                require!(
+                    table_configuration.is_feature_enabled(&mode.required_feature()),
+                    Error::Kernel(mode.feature_disabled_error(commit_file.version))
+                );
             }
         }
         // We resolve the remove deletion vector map after visiting the entire commit.
@@ -281,10 +299,10 @@ impl LogReplayScanner {
         let timestamp = if table_configuration.is_feature_enabled(&TableFeature::InCommitTimestamp)
         {
             let Some(in_commit_timestamp) = in_commit_timestamp_opt else {
-                return Err(KernelError::generic(format!(
+                return Err(Error::Kernel(KernelError::generic(format!(
                     "In-commit timestamp is enabled but not found in commit at version {}",
                     commit_file.version
-                )));
+                ))));
             };
             in_commit_timestamp
         } else {
@@ -315,7 +333,7 @@ impl LogReplayScanner {
         self,
         engine: Arc<dyn Engine>,
         filter: Option<Arc<DataSkippingFilter>>,
-    ) -> KernelResult<impl KernelResultIterator<TableChangesScanMetadata>> {
+    ) -> KernelResult<impl KernelResultIterator<TableChangesScanMetadata> + use<>> {
         let Self {
             has_cdc_action,
             remove_dvs,

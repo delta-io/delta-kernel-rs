@@ -263,8 +263,8 @@ To have Kernel hand you the typed values directly, opt in with `with_partition_v
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
 # use delta_kernel::scan::PartitionValuesOptions;
-# use delta_kernel::{KernelResult, Snapshot};
-# fn example() -> KernelResult<()> {
+# use delta_kernel::Snapshot;
+# fn example() -> delta_kernel::Result<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
 # let store = store_from_url(&url)?;
 # let engine = DefaultEngine::builder(store).build();
@@ -283,16 +283,28 @@ of parsing the string map per file. The raw string map is still present.
 
 By default, offset-less `TIMESTAMP` partition strings are interpreted in UTC. Use
 `PartitionValuesOptions::with_timestamp_timezone` with a recognized IANA timezone or a normalized
-`+HH:MM` or `-HH:MM` fixed offset to interpret offset-less partition values in another timezone. The
-configured timezone must match the timezone used when they were written. An explicit offset in a
-partition value takes precedence. When Kernel parses the partition string map, this setting affects
-both partition pruning and returned parsed partition values.
+`+HH:MM[:SS]` or `-HH:MM[:SS]` fixed offset (`Z` means UTC) to interpret offset-less partition
+values in another timezone. The exact uppercase IDs `EST`, `MST`, and `HST` use fixed offsets
+`-05:00`, `-07:00`, and `-10:00`; full IANA region names preserve historical clock transitions.
+A short ID embedded in a partition value follows its IANA region. The configured timezone must
+match the timezone used when the value was written. An offset or timezone in a partition value
+takes precedence. When Kernel parses the partition string map, this setting affects both partition
+pruning and returned parsed partition values.
 
 When a checkpoint stores compatible `partitionValues_parsed`, Kernel uses those values directly
 instead of reparsing the offset-less `TIMESTAMP` partition strings with the supplied timezone. The
 `TIMESTAMP` values in that column already represent timezone-independent instants. Each value
 represents an integer number of microseconds since the Unix epoch; for example, `0` represents
 `1970-01-01T00:00:00Z` (UTC).
+
+To see whether a batch's `partitionValues_parsed` came from the checkpoint or from the string map,
+call `ScanMetadata::partition_values_source`. It returns `None` when the batch has no
+`partitionValues_parsed` column. Checkpoint values are fixed instants; derived values of
+offset-less `TIMESTAMP` strings change with the timezone. The source also depends on the scan
+configuration, because a predicate-only scan emits only the partition fields the predicate
+references. If you cache parsed partition values across scans that use different timezones, reuse a
+cached checkpoint value only when the current batch also reports a checkpoint source for the same
+emitted fields.
 
 Kernel doesn't yet support timezone-aware row transforms for `TIMESTAMP` partitions.
 `PartitionValuesOptions::with_timestamp_timezone` omits per-file row transforms when the table has
@@ -320,7 +332,7 @@ use delta_kernel::CancellationTokenRef;
 
 // `token` is your connector's cancellation handle, implementing `CancellationToken`.
 // It is commonly a thin wrapper over your runtime's primitive (e.g.
-// `tokio_util::sync::CancellationToken`). See "Cancellation-aware reads" in
+// `tokio_util::sync::CancellationToken`). See "Support cancellation" in
 // Implementing the Engine Trait for how to build one.
 let token: CancellationTokenRef = my_request_token();
 
@@ -336,7 +348,7 @@ for metadata in scan.scan_metadata(engine)? {
 ```
 
 Cancellation is cooperative. Kernel passes the token to the Engine's
-[cancellation-aware operations](../connector/implementing_engine.md#cancellation-aware-reads),
+[cancellation-aware operations](../connector/implementing_engine.md#support-cancellation),
 which prevent new I/O after detecting cancellation. An Engine may also interrupt I/O already in
 flight.
 

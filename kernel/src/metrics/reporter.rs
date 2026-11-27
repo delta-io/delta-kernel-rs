@@ -5,15 +5,17 @@ use std::time::Instant;
 
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id, Record};
-use tracing::{event, warn, Level, Span, Subscriber};
-use tracing_subscriber::layer::Context;
+use tracing::{Level, Span, Subscriber, event, warn};
 use tracing_subscriber::Layer;
+use tracing_subscriber::layer::Context;
 
+use super::ScanPlanReport;
 use super::events::{
-    storage_metric_from_attrs, CrcReadSuccess, DomainMetadataLoadSuccess, JsonReadCompleted,
-    LogSegmentLoadSuccess, MetricEvent, ParquetReadCompleted, ProtocolMetadataLoadSuccess,
-    ScanMetadataCompleted, SetTransactionLoadSuccess, SnapshotBuildSuccess,
-    TransactionCommitSuccess, STORAGE_SPAN,
+    CheckpointWriteSuccess, ChecksumWriteSuccess, CrcReadSuccess, DomainMetadataLoadSuccess,
+    JsonReadCompleted, LastCheckpointReadCompleted, LogSegmentLoadSuccess, MetricEvent,
+    ParquetReadCompleted, ProtocolMetadataLoadSuccess, STORAGE_SPAN, ScanMetadataCompleted,
+    SetTransactionLoadSuccess, SnapshotBuildSuccess, TransactionCommitSuccess,
+    storage_metric_from_attrs,
 };
 
 // ====================================================================
@@ -106,6 +108,12 @@ where
             return;
         };
         let event = match metadata.name() {
+            ScanPlanReport::SPAN_NAME => Some(MetricEvent::ScanPlanGenerationCompleted(
+                ScanPlanReport::from_attrs(attrs),
+            )),
+            CheckpointWriteSuccess::SPAN_NAME => Some(MetricEvent::CheckpointWriteSuccess(
+                CheckpointWriteSuccess::from_attrs(attrs),
+            )),
             LogSegmentLoadSuccess::SPAN_NAME => Some(MetricEvent::LogSegmentLoadSuccess(
                 LogSegmentLoadSuccess::from_attrs(attrs),
             )),
@@ -129,6 +137,14 @@ where
             CrcReadSuccess::SPAN_NAME => Some(MetricEvent::CrcReadSuccess(
                 CrcReadSuccess::from_attrs(attrs),
             )),
+            LastCheckpointReadCompleted::SPAN_NAME => {
+                Some(MetricEvent::LastCheckpointReadCompleted(
+                    LastCheckpointReadCompleted::from_attrs(attrs),
+                ))
+            }
+            ChecksumWriteSuccess::SPAN_NAME => Some(MetricEvent::ChecksumWriteSuccess(
+                ChecksumWriteSuccess::from_attrs(attrs),
+            )),
             JsonReadCompleted::SPAN_NAME => Some(MetricEvent::JsonReadCompleted(
                 JsonReadCompleted::from_attrs(attrs),
             )),
@@ -149,8 +165,7 @@ where
     }
 
     // RUNTIME CHANNEL. on_event carries log lines, not metric writes; its only metric effect is the
-    // `#[instrument(err)]` failure signal, which FailureFlipVisitor turns into the event's failure
-    // counterpart.
+    // `#[instrument(err)]` failure signal, handled by FailureFlipVisitor.
     fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
         let Some(span) = ctx.event_span(event) else {
             return;
@@ -193,7 +208,9 @@ where
             let Some(visitor) = extensions.get_mut::<EventVisitor>() else {
                 return;
             };
-            if let (Some(d), Some(event)) = (duration, visitor.event.as_mut()) {
+            if !visitor.duration_recorded
+                && let (Some(d), Some(event)) = (duration, visitor.event.as_mut())
+            {
                 event.set_duration_if_applicable(d);
             }
             visitor.event.take()
@@ -217,6 +234,8 @@ where
 struct EventVisitor {
     event: Option<MetricEvent>,
     pending_warnings: Vec<String>,
+    // Checkpoint data can finish before the reporting span closes. Preserve its recorded duration.
+    duration_recorded: bool,
 }
 
 impl EventVisitor {
@@ -224,6 +243,7 @@ impl EventVisitor {
         Self {
             event,
             pending_warnings: vec![],
+            duration_recorded: false,
         }
     }
 
@@ -240,8 +260,12 @@ impl Visit for EventVisitor {
         let Some(event) = self.event.as_mut() else {
             return;
         };
-        if let Err(span_name) = event.record_u64(field.name(), value) {
-            self.warn_invalid(field, span_name);
+        match event.record_u64(field.name(), value) {
+            Ok(()) if field.name() == "duration_ns" => {
+                self.duration_recorded = true;
+            }
+            Ok(()) => {}
+            Err(span_name) => self.warn_invalid(field, span_name),
         }
     }
 
@@ -276,8 +300,8 @@ impl Visit for EventVisitor {
 
 /// Event-path visitor for the synthetic event `#[instrument(err)]` emits on `Err` return.
 ///
-/// Flips the span's in-flight success event to its failure counterpart and ignores every other
-/// field, so arbitrary log-line fields never reach the metric allowlist.
+/// Marks the span's in-flight metric as failed and ignores every other field, so arbitrary
+/// log-line fields never reach the metric allowlist.
 struct FailureFlipVisitor<'a> {
     event: &'a mut Option<MetricEvent>,
 }
@@ -297,19 +321,35 @@ impl Visit for FailureFlipVisitor<'_> {
 mod tests {
     use std::io::Error;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
-    use test_utils::{ensure_metrics_compatible_global_subscriber, LogWriter};
+    use test_utils::{LogWriter, ensure_metrics_compatible_global_subscriber};
     use tracing::field::Empty;
+    use tracing::span::{Attributes, Id, Record};
     use tracing::subscriber::with_default;
-    use tracing::{info, info_span, instrument};
+    use tracing::{Subscriber, info, info_span, instrument};
+    use tracing_subscriber::filter::LevelFilter;
     use tracing_subscriber::fmt::layer;
-    use tracing_subscriber::layer::SubscriberExt as _;
-    use tracing_subscriber::registry;
+    use tracing_subscriber::layer::{Identity, SubscriberExt as _};
+    use tracing_subscriber::registry::LookupSpan;
+    use tracing_subscriber::{Layer, Registry, registry, reload};
     use uuid::Uuid;
 
-    use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
-    use crate::metrics::{MetricEvent, WithMetricsReporterLayer as _};
-    use crate::unit_test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
+    use super::ReportGeneratorLayer;
+    use crate::checkpoint::{CheckpointInfo, SelectedCheckpointType};
+    use crate::metrics::events::{
+        SNAPSHOT_COMPLETED_SPAN, SnapshotLoadMetricContext, emit_log_segment_load_failure,
+        emit_protocol_metadata_load_failure,
+    };
+    use crate::metrics::{
+        CheckpointOutputStats, CheckpointProcessingStats, CheckpointWriteMode,
+        CheckpointWriteOutcome, CheckpointWriteStats, CrcReadFailureReason,
+        LastCheckpointReadOutcome, MetricEvent, MetricId, ScanPlanOutcome, ScanPlanReport,
+        WithMetricsReporterLayer as _, emit_scan_plan_completed,
+    };
+    use crate::scan::{PartitionValuesOptions, StatsOptions};
+    use crate::schema::schema_ref;
+    use crate::unit_test_utils::{CapturingReporter, install_thread_local_metrics_reporter};
 
     /// Run `f` under a subscriber that layers the metrics layer over an fmt layer capturing to a
     /// buffer, and return the captured log text -- so a test can assert on the warnings the metrics
@@ -328,6 +368,279 @@ mod tests {
         with_default(subscriber, f);
         let bytes = logs.lock().unwrap().clone();
         String::from_utf8(bytes).unwrap()
+    }
+
+    #[rstest::rstest]
+    #[case(None, CrcReadFailureReason::Error)]
+    #[case(Some("not_found"), CrcReadFailureReason::NotFound)]
+    #[case(Some("empty"), CrcReadFailureReason::Empty)]
+    #[case(Some("parsing"), CrcReadFailureReason::Parsing)]
+    #[case(Some("error"), CrcReadFailureReason::Error)]
+    #[case(Some("cancelled"), CrcReadFailureReason::Cancelled)]
+    #[case(Some("unknown"), CrcReadFailureReason::Error)]
+    #[case(Some("future_reason"), CrcReadFailureReason::Error)]
+    fn crc_failure_preserves_recorded_reason(
+        #[case] label: Option<&str>,
+        #[case] expected: CrcReadFailureReason,
+    ) {
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        {
+            let span = info_span!(
+                "crc_read_completed",
+                report = Empty,
+                bytes_read = Empty,
+                failure_reason = Empty
+            );
+            let _entered = span.enter();
+            if let Some(label) = label {
+                span.record("failure_reason", label);
+            }
+            info!(
+                failure_reason = "wrong",
+                "log fields must not overwrite metric fields"
+            );
+            info!(error = %"injected error");
+            span.record("bytes_read", 100_u64);
+            span.record("failure_reason", false);
+        }
+        let events = reporter.events();
+        let [MetricEvent::CrcReadFailure(event)] = events.as_slice() else {
+            panic!("expected one CRC failure metric: {events:?}");
+        };
+        assert_eq!(event.reason, expected);
+        assert_eq!(
+            events[0].to_string(),
+            format!("CrcReadFailure(reason={expected})")
+        );
+    }
+
+    #[test]
+    fn crc_invalid_reason_warns_after_releasing_extension_lock() {
+        let logs = capture_logs(|| {
+            let span = info_span!("crc_read_completed", report = Empty, failure_reason = Empty);
+            let _entered = span.enter();
+            span.record("failure_reason", "not_a_reason");
+        });
+        assert!(
+            logs.contains("Invalid field 'failure_reason' recorded on crc_read_completed span")
+        );
+    }
+
+    #[rstest::rstest]
+    fn scan_plan_completion_respects_filter_and_reload(
+        #[values(false, true)] accepted: bool,
+        #[values(false, true)] reload_wrapped: bool,
+        #[values(false, true)] with_checkpoint: bool,
+        #[values(0, 64)] schema_depth: usize,
+        #[values(
+            StatsOptions::none(),
+            StatsOptions::all_struct_with_extra_indexed(vec![crate::expressions::column_name!("nested", "a.b")]),
+            StatsOptions::struct_columns(vec![crate::expressions::column_name!("nested", "a.b")]),
+        )]
+        stats: StatsOptions,
+    ) {
+        ensure_metrics_compatible_global_subscriber();
+        let reporter = Arc::new(CapturingReporter::default());
+        let reporting = ReportGeneratorLayer::new(reporter.clone());
+        let reporting: Box<dyn Layer<Registry> + Send + Sync> = if reload_wrapped {
+            Box::new(reload::Layer::new(reporting).0)
+        } else {
+            Box::new(reporting)
+        };
+        let level = if accepted {
+            LevelFilter::INFO
+        } else {
+            LevelFilter::OFF
+        };
+        let subscriber = registry()
+            .with(reporting.with_filter(level))
+            .with(Identity::new().with_filter(LevelFilter::INFO));
+        assert!(
+            tracing::Dispatch::new(LookupOnlySubscriber(registry()))
+                .downcast_ref::<Registry>()
+                .is_none()
+        );
+        let stats = stats.with_variant_min_max_stats(true);
+        #[cfg(feature = "geo-type-in-dev")]
+        let stats = stats.with_geometry_min_max_stats(true);
+        let leaf_schema = (0..schema_depth).fold(schema_ref! {}, |schema, _| {
+            Arc::new(
+                crate::schema::StructType::try_new([crate::schema::StructField::nullable(
+                    "nested",
+                    schema.as_ref().clone(),
+                )])
+                .unwrap(),
+            )
+        });
+        let report = ScanPlanReport {
+            operation_id: MetricId::new(),
+            table_id: "table-test".into(),
+            table_path: "s3://bucket/table%20path/".into(),
+            correlation_id: with_checkpoint.then(|| Arc::from("")),
+            outcome: ScanPlanOutcome::Plan,
+            duration_ns: 17,
+            num_plan_nodes: 3,
+            checkpoint: with_checkpoint.then(|| crate::metrics::CheckpointMetrics {
+                version: 0,
+                info: Some(Arc::new(CheckpointInfo {
+                    checkpoint_type: SelectedCheckpointType::V2,
+                    leaf_checkpoint_schema: leaf_schema,
+                    sidecars: vec![crate::FileMeta {
+                        location: url::Url::parse("memory:///sidecar.parquet").unwrap(),
+                        last_modified: 23,
+                        size: 13,
+                    }]
+                    .into(),
+                    size_in_bytes: 30,
+                    last_checkpoint: Box::new(
+                        serde_json::from_value(serde_json::json!({
+                            "version": 0, "size": 2,
+                        }))
+                        .unwrap(),
+                    ),
+                })),
+                source: Some(crate::metrics::CheckpointSource::Resolved),
+                root_footer_calls: 2,
+                sidecar_footer_calls: 3,
+                metadata_query_calls: 4,
+                duration_ns: 5,
+            }),
+            metadata_planning: crate::metrics::MetadataPlanningReport {
+                stats,
+                partition_values: PartitionValuesOptions::with_struct()
+                    .with_timestamp_timezone("UTC"),
+                read_collations: true,
+                has_filter: true,
+                replay_base: Some(crate::metrics::ReplayBase::Checkpoint),
+                base_version: Some(0),
+                commit_start_version: Some(1),
+                commit_end_version: Some(2),
+                commit_total_size_bytes: 11,
+                compaction_file_count: 1,
+                total_json_bytes: 19,
+                total_parquet_bytes: 30,
+            },
+        };
+        with_default(LookupOnlySubscriber(subscriber), || {
+            emit_scan_plan_completed(&report)
+        });
+        let events = reporter.events();
+        match (accepted, events.as_slice()) {
+            (false, []) => {}
+            (true, [MetricEvent::ScanPlanGenerationCompleted(actual)]) => {
+                assert_eq!(format!("{actual:?}"), format!("{report:?}"));
+            }
+            _ => panic!("unexpected scan-plan completions: {events:?}"),
+        }
+    }
+
+    // LookupSpan support does not require exposing Registry through Subscriber::downcast_raw.
+    struct LookupOnlySubscriber<S>(S);
+
+    impl<S: Subscriber> Subscriber for LookupOnlySubscriber<S> {
+        fn on_register_dispatch(&self, dispatch: &tracing::Dispatch) {
+            self.0.on_register_dispatch(dispatch);
+        }
+        fn register_callsite(
+            &self,
+            metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            self.0.register_callsite(metadata)
+        }
+        fn max_level_hint(&self) -> Option<LevelFilter> {
+            self.0.max_level_hint()
+        }
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            self.0.enabled(metadata)
+        }
+        fn new_span(&self, attrs: &Attributes<'_>) -> Id {
+            self.0.new_span(attrs)
+        }
+        fn record(&self, span: &Id, values: &Record<'_>) {
+            self.0.record(span, values);
+        }
+        fn record_follows_from(&self, span: &Id, follows: &Id) {
+            self.0.record_follows_from(span, follows);
+        }
+        fn event(&self, event: &tracing::Event<'_>) {
+            self.0.event(event);
+        }
+        fn enter(&self, span: &Id) {
+            self.0.enter(span);
+        }
+        fn exit(&self, span: &Id) {
+            self.0.exit(span);
+        }
+        fn clone_span(&self, id: &Id) -> Id {
+            self.0.clone_span(id)
+        }
+        fn try_close(&self, id: Id) -> bool {
+            self.0.try_close(id)
+        }
+    }
+
+    impl<'a, S: Subscriber + LookupSpan<'a>> LookupSpan<'a> for LookupOnlySubscriber<S> {
+        type Data = <S as LookupSpan<'a>>::Data;
+        fn span_data(&'a self, id: &Id) -> Option<Self::Data> {
+            self.0.span_data(id)
+        }
+        fn register_filter(&mut self) -> tracing_subscriber::filter::FilterId {
+            self.0.register_filter()
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::missing(None, LastCheckpointReadOutcome::Unknown)]
+    #[case::empty(Some(""), LastCheckpointReadOutcome::Unknown)]
+    #[case::invalid(Some("not_an_outcome"), LastCheckpointReadOutcome::Unknown)]
+    #[case::success(Some("success"), LastCheckpointReadOutcome::Success)]
+    #[case::not_found(Some("not_found"), LastCheckpointReadOutcome::NotFound)]
+    #[case::invalid_hint(Some("invalid"), LastCheckpointReadOutcome::Invalid)]
+    #[case::error(Some("error"), LastCheckpointReadOutcome::Error)]
+    #[case::unknown(Some("unknown"), LastCheckpointReadOutcome::Unknown)]
+    fn last_checkpoint_read_decodes_outcome_and_records_duration(
+        #[case] value: Option<&str>,
+        #[case] expected: LastCheckpointReadOutcome,
+        #[values(false, true)] error_event: bool,
+    ) {
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        {
+            let span = info_span!("last_checkpoint.read", report = Empty, outcome = Empty);
+            let _entered = span.enter();
+            if let Some(value) = value {
+                span.record("outcome", value);
+            }
+            info!(
+                outcome = "invalid",
+                "log fields must not overwrite metric fields"
+            );
+            if error_event {
+                info!(error = %"injected error");
+            }
+        }
+        let events = reporter.events();
+        let [MetricEvent::LastCheckpointReadCompleted(event)] = events.as_slice() else {
+            panic!("expected one last checkpoint metric: {events:?}");
+        };
+        let expected = if error_event && expected == LastCheckpointReadOutcome::Unknown {
+            LastCheckpointReadOutcome::Error
+        } else {
+            expected
+        };
+        assert_eq!(event.outcome, expected);
+        assert!(event.duration > Duration::ZERO);
+    }
+
+    #[test]
+    fn last_checkpoint_invalid_outcome_warns_after_releasing_extension_lock() {
+        let logs = capture_logs(|| {
+            let span = info_span!("last_checkpoint.read", report = Empty, outcome = Empty);
+            let _entered = span.enter();
+            span.record("outcome", "not_an_outcome");
+        });
+        assert!(logs.contains("Invalid field 'outcome' recorded on last_checkpoint.read span"));
     }
 
     #[test]
@@ -367,6 +680,145 @@ mod tests {
         );
     }
 
+    #[rstest::rstest]
+    fn checkpoint_recorded_duration_survives_span_close_and_errors(
+        #[values(0u64, 17)] duration_ns: u64,
+        #[values(false, true)] fail: bool,
+    ) {
+        let operation_id = MetricId::new();
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        {
+            let span = info_span!(
+                "snap.checkpoint",
+                report = Empty,
+                operation_id = %operation_id,
+                version = 42u64,
+                outcome = Empty,
+                mode = Empty,
+                duration_ns = Empty,
+                bytes_written = Empty,
+                size_in_bytes = Empty,
+                num_add_files = Empty,
+                num_remove_files = Empty,
+                num_actions = Empty,
+                num_sidecars = Empty,
+                log_tail_input_duration_ns = Empty,
+                checkpoint_input_duration_ns = Empty,
+                reconciliation_duration_ns = Empty,
+                stats_transform_duration_ns = Empty,
+                output_preparation_duration_ns = Empty,
+                num_actions_from_log_tail = Empty,
+                num_actions_from_checkpoint = Empty,
+                parquet_write_duration_ns = Empty,
+                verification_duration_ns = Empty,
+                num_sidecars_written = Empty,
+            );
+            let _entered = span.enter();
+            span.record("mode", "v2_with_sidecars");
+            span.record("duration_ns", duration_ns);
+            span.record("size_in_bytes", 50u64);
+            span.record("num_add_files", 1u64);
+            span.record("num_remove_files", 0u64);
+            span.record("num_actions", 5u64);
+            span.record("num_sidecars", 1u64);
+            for (name, value) in [
+                ("log_tail_input_duration_ns", 1u64),
+                ("reconciliation_duration_ns", 2),
+                ("stats_transform_duration_ns", 3),
+                ("output_preparation_duration_ns", 4),
+                ("num_actions_from_log_tail", 5),
+                ("num_actions_from_checkpoint", 6),
+                ("checkpoint_input_duration_ns", 7),
+                ("parquet_write_duration_ns", 8),
+                ("verification_duration_ns", 9),
+                ("bytes_written", 10),
+                ("num_sidecars_written", 11),
+            ] {
+                span.record(name, value);
+            }
+            if fail {
+                info!(error = %"injected error");
+            }
+        }
+        let events = reporter.events();
+        assert_eq!(events.len(), 1);
+        let (mode, duration, id, version, processing, output) = match (&events[0], fail) {
+            (MetricEvent::CheckpointWriteFailure(event), true) => (
+                event.mode,
+                event.duration,
+                event.operation_id,
+                event.version,
+                event.processing_stats,
+                event.output_stats,
+            ),
+            (MetricEvent::CheckpointWriteSuccess(event), false) => {
+                assert_eq!(
+                    event.outcome,
+                    CheckpointWriteOutcome::Written {
+                        stats: CheckpointWriteStats {
+                            size_in_bytes: 50,
+                            num_add_files: 1,
+                            num_remove_files: 0,
+                            num_actions: 5,
+                            num_sidecars: 1,
+                        }
+                    }
+                );
+                (
+                    event.mode,
+                    event.duration,
+                    event.operation_id,
+                    event.version,
+                    event.processing_stats,
+                    event.output_stats,
+                )
+            }
+            (event, _) => panic!("unexpected checkpoint metric: {event:?}"),
+        };
+        assert_eq!(duration, Duration::from_nanos(duration_ns));
+        assert_eq!(mode, CheckpointWriteMode::V2WithSidecars);
+        assert_eq!(id, operation_id);
+        assert_eq!(version, 42);
+        assert_eq!(
+            processing,
+            CheckpointProcessingStats {
+                log_tail_input_duration: Duration::from_nanos(1),
+                checkpoint_input_duration: Duration::from_nanos(7),
+                reconciliation_duration: Duration::from_nanos(2),
+                stats_transform_duration: Duration::from_nanos(3),
+                output_preparation_duration: Duration::from_nanos(4),
+                num_actions_from_log_tail: 5,
+                num_actions_from_checkpoint: 6,
+            }
+        );
+        assert_eq!(
+            output,
+            CheckpointOutputStats {
+                parquet_write_duration: Duration::from_nanos(8),
+                verification_duration: Duration::from_nanos(9),
+                bytes_written: 10,
+                num_sidecars_written: 11,
+            }
+        );
+    }
+
+    #[test]
+    fn checkpoint_invalid_enum_fields_warn_without_reentering_the_extension_lock() {
+        let logs = capture_logs(|| {
+            let span = info_span!(
+                "snap.checkpoint",
+                report = Empty,
+                outcome = Empty,
+                mode = Empty
+            );
+            span.record("outcome", "invalid");
+            span.record("mode", "invalid");
+        });
+        assert!(logs.contains("Invalid field 'outcome' recorded on snap.checkpoint span"));
+        assert!(logs.contains("Invalid field 'mode' recorded on snap.checkpoint span"));
+    }
+
     // A log line whose field name collides with a real metric field must NOT overwrite the value a
     // genuine `span.record` wrote -- the core guarantee of narrowing on_event to
     // FailureFlipVisitor. capture_logs discards the reporter, so this test installs a
@@ -400,23 +852,50 @@ mod tests {
         );
     }
 
-    #[instrument(name = SNAPSHOT_COMPLETED_SPAN, fields(report, operation_id = %Uuid::new_v4()), err)]
-    fn failing_build() -> Result<(), Error> {
+    #[instrument(
+        name = SNAPSHOT_COMPLETED_SPAN,
+        skip_all,
+        fields(report, operation_id = %Uuid::new_v4()),
+        err
+    )]
+    fn failing_build(delay: Duration) -> Result<(), Error> {
+        std::thread::sleep(delay);
         Err(Error::other("boom"))
     }
 
     #[test]
-    fn instrument_err_event_still_flips_to_failure() {
+    fn instrument_err_event_reports_elapsed_failure_duration() {
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
-        let _ = failing_build();
+        let delay = Duration::from_millis(1);
+        let _ = failing_build(delay);
+        let events = reporter.events();
         assert!(
-            reporter
-                .events()
-                .iter()
-                .any(|e| matches!(e, MetricEvent::SnapshotBuildFailure(_))),
-            "#[instrument(err)] must flip the success event to its failure form via on_event"
+            matches!(events.as_slice(), [MetricEvent::SnapshotBuildFailure(event)] if event.duration >= delay),
+            "expected one snapshot build failure with duration >= {delay:?}; got: {events:?}"
         );
+    }
+
+    #[rstest::rstest]
+    fn failure_emitters_preserve_operation_duration(#[values(0u64, 73)] duration_ns: u64) {
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        let context = SnapshotLoadMetricContext::for_test();
+        let duration = Duration::from_nanos(duration_ns);
+
+        emit_log_segment_load_failure(&context, duration);
+        emit_protocol_metadata_load_failure(&context, duration);
+
+        let events = reporter.events();
+        let [
+            MetricEvent::LogSegmentLoadFailure(segment),
+            MetricEvent::ProtocolMetadataLoadFailure(pm),
+        ] = events.as_slice()
+        else {
+            panic!("expected log-segment and protocol/metadata failures; got: {events:?}");
+        };
+        assert_eq!(segment.duration, duration);
+        assert_eq!(pm.duration, duration);
     }
 
     #[instrument(name = SNAPSHOT_COMPLETED_SPAN, fields(report, operation_id = %Uuid::new_v4()), ret)]

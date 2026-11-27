@@ -7,6 +7,9 @@
 //! The [`delta_kernel_default_engine`](https://docs.rs/delta_kernel_default_engine) crate provides
 //! a ready-to-use implementation based on Arrow, `object_store`, and Tokio.
 //!
+//! The [Delta Kernel user guide](https://docs.delta.io/kernel/rust/) explains end-to-end connector
+//! workflows. This crate's rustdoc is the source of truth for exact API contracts.
+//!
 //! A full `rust` example for reading table data using the default engine can be found in the
 //! [read-table-single-threaded] example (and for a more complex multi-threaded reader see the
 //! [read-table-multi-threaded] example). An example for reading the table changes for a table
@@ -100,6 +103,7 @@ pub(crate) mod crc;
 pub mod engine_data;
 pub mod error;
 pub mod expressions;
+mod file_uri;
 pub mod incremental_scan;
 mod log_compaction;
 mod log_path;
@@ -119,6 +123,7 @@ pub mod table_features;
 pub mod table_properties;
 pub mod transaction;
 pub mod transforms;
+pub(crate) mod uri_reference;
 
 pub use crc::{FileSizeHistogram, FileStats};
 pub use log_path::LogPath;
@@ -149,7 +154,7 @@ pub mod utils;
 pub(crate) mod utils;
 
 #[cfg(feature = "internal-api")]
-pub use utils::{try_parse_uri, CollectInto, FoldWithOption};
+pub use utils::{CollectInto, FoldWithOption, try_parse_uri};
 
 // for the below modules, we cannot introduce a macro to clean this up. rustfmt doesn't follow into
 // macros, and so will not format the files associated with these modules if we get too clever. see:
@@ -188,32 +193,39 @@ pub mod parallel;
 pub(crate) mod parallel;
 
 pub use action_reconciliation::{ActionReconciliationIterator, ActionReconciliationIteratorState};
-use cancellation::{check_cancelled, CancellableIterator};
+use cancellation::{CancellableIterator, check_cancelled};
 pub use cancellation::{CancellationToken, CancellationTokenRef, CancelledFuture};
 pub use delta_kernel_derive;
 pub use engine_data::{
     EngineData, FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, RowVisitor,
 };
-pub use error::{Error, KernelError, KernelResult, KernelResultIterator, Result};
+pub use error::{
+    BoxedError, DeltaError, DeltaErrorCondition, DeltaErrorParameter, Error, KernelError,
+    KernelResult, KernelResultIterator, Result,
+};
 use expressions::Scalar;
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
-pub use log_compaction::{should_compact, LogCompactionWriter};
+pub use file_uri::{ReferencedFilePath, resolve_file_uri};
+pub use log_compaction::{LogCompactionWriter, should_compact};
 #[cfg(feature = "declarative-plans")]
-pub use plans::{IoOperation, Operation, PlanBuilder, PlanExecutor, PlanResult};
+pub use plans::{IoOperation, Operation, PlanBuilder, PlanExecutor, PlanExecutorExt, PlanResult};
 use schema::StructField;
-pub use snapshot::{Snapshot, SnapshotRef};
+pub use snapshot::{Snapshot, SnapshotReader, SnapshotRef};
 
+// `test-utils` exposes the test engines without requiring Arrow or declarative plans.
 #[cfg(any(
     feature = "default-engine-base",
     feature = "arrow-conversion",
-    feature = "declarative-plans"
+    feature = "declarative-plans",
+    feature = "test-utils"
 ))]
 pub mod engine;
 
 #[cfg(not(any(
     feature = "default-engine-base",
     feature = "arrow-conversion",
-    feature = "declarative-plans"
+    feature = "declarative-plans",
+    feature = "test-utils"
 )))]
 pub(crate) mod engine;
 
@@ -451,11 +463,16 @@ impl<T: PartialEq + AsAny> DynPartialEq for T {
 /// Connectors can implement this trait to optimize the evaluation using the
 /// connector specific capabilities.
 pub trait ExpressionEvaluator: AsAny {
-    /// Evaluate the expression on a given EngineData.
+    /// Evaluates the expression on `batch`.
     ///
-    /// Produces one value for each row of the input.
-    /// The data type of the output is same as the type output of the expression this evaluator is
-    /// using.
+    /// Produces one value for each input row using the evaluator's output type. If the output is a
+    /// struct, its fields become output columns. A NULL struct row produces NULL in every output
+    /// column without changing the row count.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if evaluation fails, including when a NULL struct row would put NULL in a
+    /// non-nullable output column.
     fn evaluate(&self, batch: &dyn EngineData) -> KernelResult<Box<dyn EngineData>>;
 }
 
@@ -481,9 +498,13 @@ pub trait EvaluationHandler: AsAny {
     ///
     /// If the provided output type is a struct, its fields describe the columns of output produced
     /// by the evaluator. Otherwise, the output schema is a single column named "output" of the
-    /// specified `output_type`. In all cases, the output schema is only used for its names (all
-    /// field names will be updated to match) and nullability (non-nullable columns can be converted
-    /// to nullable). Any mismatch in types (including number of columns) will produce an error.
+    /// specified `output_type`. Output field names and nullability are updated to match
+    /// `output_type` (non-nullable columns can be made nullable). Incompatible types or a different
+    /// number of columns produce an error.
+    ///
+    /// The Arrow-based evaluator casts compatible leaf types to the requested output types. It
+    /// uses Arrow's safe casts: reducing timestamp precision truncates toward zero, and values
+    /// that cannot be converted (for example, timestamp scaling overflow) become null.
     ///
     /// # Parameters
     ///
@@ -573,7 +594,17 @@ pub trait StorageHandler: AsAny {
     ///   contains all files at or below that directory.
     /// - Otherwise, the parent is the directory containing `path`, and only files (at any depth
     ///   under that parent) whose full path sorts strictly greater than `path` are returned.
-    fn list_from(&self, path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>>;
+    ///
+    /// When `end` is present, every yielded location must sort strictly before it by
+    /// percent-decoded URL path (UTF-8 byte order). That is the same space engines use for the
+    /// listing offset derived from `path`, so a bound built with `Url::join` still matches listed
+    /// locations even when the caller's URL percent-encodes unreserved characters. Stream errors
+    /// are preserved and are not a stop signal.
+    fn list_from(
+        &self,
+        path: &Url,
+        end: Option<&Url>,
+    ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>>;
 
     /// Cancellation-aware variant of [`list_from`].
     ///
@@ -586,10 +617,11 @@ pub trait StorageHandler: AsAny {
     fn list_from_with_cancellation(
         &self,
         path: &Url,
+        end: Option<&Url>,
         cancellation_token: Option<CancellationTokenRef>,
     ) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>> {
         check_cancelled(cancellation_token.as_ref())?;
-        let iter = self.list_from(path)?;
+        let iter = self.list_from(path, end)?;
         Ok(Box::new(CancellableIterator::new(iter, cancellation_token)))
     }
 
@@ -637,6 +669,94 @@ pub trait StorageHandler: AsAny {
     /// This operation is idempotent: deleting a path that does not exist should return `Ok(())`.
     /// For any other error, this must propagate the corresponding error.
     fn delete(&self, path: &Url) -> KernelResult<()>;
+}
+
+/// Whether a listing item should be yielded given an exclusive URL upper bound.
+///
+/// Errors are never a stop signal. When `end` is `Some`, an `Ok` item is kept only if its
+/// percent-decoded path sorts strictly before `end`'s. This helper percent-decodes both paths
+/// itself; pass URLs as produced by listing or `Url::join`, not pre-decoded strings.
+///
+/// Engines that list and then filter can use this as the `take_while` / `filter` predicate when
+/// implementing [`StorageHandler::list_from`]. `take_while` is valid only when the stream is
+/// already sorted in that same decoded-path order.
+pub fn keep_listing(item: &KernelResult<FileMeta>, end: Option<&Url>) -> bool {
+    match item {
+        Ok(meta) => end.is_none_or(|end| {
+            path_encoding::uri_decode_path(meta.location.path())
+                .zip(path_encoding::uri_decode_path(end.path()))
+                .is_none_or(|(location, end)| location.as_ref() < end.as_ref())
+        }),
+        Err(_) => true,
+    }
+}
+
+#[cfg(test)]
+mod keep_listing_tests {
+    use super::*;
+
+    fn meta(url: &str) -> FileMeta {
+        FileMeta::new(Url::parse(url).unwrap(), 0, 0)
+    }
+
+    #[test]
+    fn keeps_errors_and_unbounded_listings() {
+        let err = Err(KernelError::generic("boom"));
+        assert!(keep_listing(&err, None));
+        assert!(keep_listing(
+            &err,
+            Some(&Url::parse("s3://bucket/table/_delta_log/:").unwrap())
+        ));
+        assert!(keep_listing(
+            &Ok(meta("s3://bucket/table/_delta_log/1.json")),
+            None
+        ));
+    }
+
+    #[test]
+    fn compares_percent_decoded_paths() {
+        let end = Url::parse("s3://bucket/t%61ble/_delta_log/:").unwrap();
+        // Listed locations rebuild the object key with path_segments_mut, so unreserved escapes
+        // become literal characters while the caller-built bound may still contain %61.
+        assert!(keep_listing(
+            &Ok(meta(
+                "s3://bucket/table/_delta_log/00000000000000000000.json"
+            )),
+            Some(&end)
+        ));
+        assert!(!keep_listing(
+            &Ok(meta("s3://bucket/table/_delta_log/_staged_commits/x.json")),
+            Some(&end)
+        ));
+        assert!(!keep_listing(
+            &Ok(meta("s3://bucket/table/_delta_log/:")),
+            Some(&end)
+        ));
+    }
+
+    #[test]
+    fn compares_unicode_by_decoded_utf8_order() {
+        // Native/object-store order is z then é. URL-string order puts %C3%A9 before m and z.
+        let end_m = Url::parse("s3://bucket/dir/m").unwrap();
+        assert!(!keep_listing(
+            &Ok(meta("s3://bucket/dir/z.json")),
+            Some(&end_m)
+        ));
+        assert!(!keep_listing(
+            &Ok(meta("s3://bucket/dir/%C3%A9.json")),
+            Some(&end_m)
+        ));
+
+        let end_tilde = Url::parse("s3://bucket/dir/~").unwrap();
+        assert!(keep_listing(
+            &Ok(meta("s3://bucket/dir/z.json")),
+            Some(&end_tilde)
+        ));
+        assert!(!keep_listing(
+            &Ok(meta("s3://bucket/dir/%C3%A9.json")),
+            Some(&end_tilde)
+        ));
+    }
 }
 
 /// Provides JSON handling functionality to Delta Kernel.
@@ -1059,6 +1179,10 @@ pub trait ParquetHandler: AsAny {
 /// on Delta tables.
 ///
 /// Connectors pass an implementation of this trait to Delta Kernel operations.
+/// See the [Engine implementation guide] for the cross-API workflow.
+///
+/// [Engine implementation guide]:
+/// https://docs.delta.io/kernel/rust/connector/implementing_engine.html
 pub trait Engine: AsAny {
     /// Get the connector provided [`EvaluationHandler`].
     fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler>;
@@ -1119,11 +1243,12 @@ mod tests {
         let meta = FileMeta::new(Url::parse("file:///x").unwrap(), 0, size);
         match expected {
             Some(v) => assert_eq!(meta.size_as_i64().unwrap(), v),
-            None => assert!(meta
-                .size_as_i64()
-                .unwrap_err()
-                .to_string()
-                .contains("exceeds i64::MAX")),
+            None => assert!(
+                meta.size_as_i64()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("exceeds i64::MAX")
+            ),
         }
     }
 }

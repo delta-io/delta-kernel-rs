@@ -2,6 +2,7 @@
 //! execution to happen outside of Rust).
 use std::sync::Arc;
 
+use delta_kernel::plans::PlanExecutorCapabilities;
 use delta_kernel::plans::proto::schema as proto_schema;
 use delta_kernel::schema::StructType;
 use delta_kernel::{KernelError, KernelResult, Operation, ParquetFooter, PlanExecutor, PlanResult};
@@ -11,7 +12,7 @@ use prost::Message as _;
 use crate::error::EngineExecResult;
 use crate::plans::iter::{FfiBytesIter, FfiEngineDataIter, FfiFileMetaIter};
 use crate::plans::result::{CParquetFooter, CPlanResult};
-use crate::{kernel_bytes_slice, KernelBytesSlice, NullableCvoid};
+use crate::{KernelBytesSlice, NullableCvoid, kernel_bytes_slice};
 
 /// A shared (`Arc`-like) handle to an [`PlanExecutor`].
 #[handle_descriptor(target=dyn PlanExecutor, mutable=false)]
@@ -35,11 +36,12 @@ pub type CExecuteOpFn = extern "C" fn(
 
 /// A [`PlanExecutor`] implementation that forwards each [`Operation`] to a C callback.
 ///
-/// Constructed and managed via [`get_plan_executor`](super::get_plan_executor) and
-/// [`free_plan_executor`](super::free_plan_executor).
+/// Constructed via [`get_plan_executor`](super::get_plan_executor), and released via
+/// [`free_plan_executor`](super::free_plan_executor) when not consumed by an engine.
 pub struct FfiPlanExecutor {
     context: NullableCvoid,
     callback: CExecuteOpFn,
+    capabilities: PlanExecutorCapabilities,
 }
 
 impl FfiPlanExecutor {
@@ -47,8 +49,16 @@ impl FfiPlanExecutor {
     ///
     /// The `context` pointer and `callback` must satisfy the thread-safety and lifetime
     /// requirements documented on [`get_plan_executor`](super::get_plan_executor).
-    pub(crate) fn new(context: NullableCvoid, callback: CExecuteOpFn) -> Self {
-        Self { context, callback }
+    pub(crate) fn new(
+        context: NullableCvoid,
+        callback: CExecuteOpFn,
+        capabilities: PlanExecutorCapabilities,
+    ) -> Self {
+        Self {
+            context,
+            callback,
+            capabilities,
+        }
     }
 }
 
@@ -57,20 +67,25 @@ unsafe impl Send for FfiPlanExecutor {}
 unsafe impl Sync for FfiPlanExecutor {}
 
 impl PlanExecutor for FfiPlanExecutor {
+    fn capabilities(&self) -> PlanExecutorCapabilities {
+        self.capabilities
+    }
+
     fn execute_op(&self, op: Operation) -> KernelResult<PlanResult> {
         let plan_proto_bytes = op.to_proto_bytes();
         let plan_proto_slice = kernel_bytes_slice!(plan_proto_bytes);
 
         let mut out = EngineExecResult::Uninit;
         (self.callback)(self.context, plan_proto_slice, &mut out);
-        let plan_result =
-            match out {
-                EngineExecResult::Success(plan) => plan,
-                EngineExecResult::Failure(err) => return Err(err.into()),
-                EngineExecResult::Uninit => return Err(KernelError::internal_error(
+        let plan_result = match out {
+            EngineExecResult::Success(plan) => plan,
+            EngineExecResult::Failure(err) => return Err(err.into()),
+            EngineExecResult::Uninit => {
+                return Err(KernelError::internal_error(
                     "FFI engine returned from execute_op upcall without writing the plan result",
-                )),
-            };
+                ));
+            }
+        };
         match plan_result {
             CPlanResult::Unit => Ok(PlanResult::Unit),
             CPlanResult::Data(it) => Ok(PlanResult::Data(Box::new(FfiEngineDataIter::new(it)))),
@@ -102,26 +117,25 @@ fn decode_parquet_footer(footer: CParquetFooter) -> KernelResult<ParquetFooter> 
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::c_void;
     use std::ptr::NonNull;
     use std::sync::{Arc, Mutex};
 
+    use delta_kernel::KernelError;
     use delta_kernel::arrow::array::ffi::FFI_ArrowArray;
     use delta_kernel::plans::proto::{operation as proto, schema as proto_schema};
-    use delta_kernel::schema::{schema, DataType as KernelDataType};
-    use delta_kernel::KernelError;
+    use delta_kernel::schema::{DataType as KernelDataType, schema};
     use prost::Message;
     use url::Url;
 
     use super::*;
     use crate::error::{EngineExecError, FFIKernelError};
     use crate::handle::Handle;
-    use crate::plans::get_plan_executor;
     use crate::plans::iter::{CBytesIterator, CEngineDataIterator, CFileMetaIterator};
     use crate::plans::result::CParquetFooter;
+    use crate::plans::{FfiPlanExecutorCapabilities, get_plan_executor};
     use crate::{
-        allocate_kernel_bytes, kernel_bytes_slice, ExclusiveEngineData, ExclusiveRustString,
-        OptionalValue,
+        ExclusiveEngineData, ExclusiveRustString, OptionalValue, allocate_kernel_bytes,
+        kernel_bytes_slice,
     };
 
     extern "C" fn noop_free(_state: NullableCvoid) {}
@@ -146,13 +160,15 @@ mod tests {
     /// `expected_plan_result`, returning the raw result of `execute_op`.
     fn try_execute_dummy_op(expected_plan_result: CPlanResult) -> KernelResult<PlanResult> {
         let cell: Mutex<Option<CPlanResult>> = Mutex::new(Some(expected_plan_result));
-        let context = NonNull::new(&cell as *const Mutex<Option<CPlanResult>> as *mut c_void);
-        let executor = unsafe { get_plan_executor(context, mock_execute_op) };
+        let context = Some(NonNull::from_ref(&cell).cast());
+        let executor = unsafe {
+            get_plan_executor(context, mock_execute_op, FfiPlanExecutorCapabilities::Full)
+        };
         let plan_executor: Arc<dyn PlanExecutor> = unsafe { executor.into_inner() };
 
         // Construct a dummy op because we don't actually care about the plan bytes here.
         let url = Url::parse("memory:///table/").unwrap();
-        let op = Operation::IoOperation(delta_kernel::IoOperation::file_listing(url));
+        let op = Operation::IoOperation(delta_kernel::IoOperation::file_listing(url, None));
 
         plan_executor.execute_op(op)
     }
@@ -188,11 +204,12 @@ mod tests {
             unsafe { out.write(EngineExecResult::Failure(err)) };
         }
 
-        let executor = unsafe { get_plan_executor(None, fail_execute_op) };
+        let executor =
+            unsafe { get_plan_executor(None, fail_execute_op, FfiPlanExecutorCapabilities::Full) };
         let plan_executor: Arc<dyn PlanExecutor> = unsafe { executor.into_inner() };
 
         let url = Url::parse("memory:///table/").unwrap();
-        let op = Operation::IoOperation(delta_kernel::IoOperation::file_listing(url));
+        let op = Operation::IoOperation(delta_kernel::IoOperation::file_listing(url, None));
 
         let Err(err) = plan_executor.execute_op(op) else {
             panic!("execute_op should surface the engine failure");
@@ -213,11 +230,12 @@ mod tests {
         ) {
         }
 
-        let executor = unsafe { get_plan_executor(None, noop_execute_op) };
+        let executor =
+            unsafe { get_plan_executor(None, noop_execute_op, FfiPlanExecutorCapabilities::Full) };
         let plan_executor: Arc<dyn PlanExecutor> = unsafe { executor.into_inner() };
 
         let url = Url::parse("memory:///table/").unwrap();
-        let op = Operation::IoOperation(delta_kernel::IoOperation::file_listing(url));
+        let op = Operation::IoOperation(delta_kernel::IoOperation::file_listing(url, None));
 
         let Err(err) = plan_executor.execute_op(op) else {
             panic!("execute_op should surface an error when the engine does not write the result");
@@ -337,14 +355,16 @@ mod tests {
                 panic!("expected a FileListing");
             };
             assert_eq!(file_listing.url, "memory:///table/");
+            assert!(file_listing.end.is_none());
             unsafe { out.write(EngineExecResult::Success(CPlanResult::Unit)) };
         }
 
-        let executor = unsafe { get_plan_executor(None, validate_op) };
+        let executor =
+            unsafe { get_plan_executor(None, validate_op, FfiPlanExecutorCapabilities::Full) };
         let plan_executor: Arc<dyn PlanExecutor> = unsafe { executor.into_inner() };
 
         let url = Url::parse("memory:///table/").unwrap();
-        let op = Operation::IoOperation(delta_kernel::IoOperation::file_listing(url));
+        let op = Operation::IoOperation(delta_kernel::IoOperation::file_listing(url, None));
 
         plan_executor
             .execute_op(op)

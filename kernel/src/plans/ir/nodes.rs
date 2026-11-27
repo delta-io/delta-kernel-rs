@@ -7,14 +7,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use derive_more::From;
-use itertools::Itertools;
 use strum::Display;
 use url::Url;
 
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
-use crate::error::add_scalar_path_context;
 use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar, StructData};
-use crate::schema::{lazy_schema_ref, DataType, SchemaRef, StructField, StructType, ToSchema};
+use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema, lazy_schema_ref};
 use crate::utils::CollectInto;
 use crate::{FileMeta, KernelError, KernelResult};
 
@@ -26,7 +24,8 @@ use crate::{FileMeta, KernelError, KernelResult};
 /// documenting that operator's semantics, invariants, and output shape.
 ///
 /// An operator that reshapes its rows (a source, projection, aggregation, or file scan) carries a
-/// caller-declared `schema` field holding its output schema. File writes emit [`FILE_META_SCHEMA`].
+/// caller-declared `schema` field holding its output schema. File writes emit [`FILE_META_SCHEMA`]
+/// followed by any configured statistics; see [`WriteParquet`].
 /// The remaining operators inherit an input's schema; each payload's docs name which input.
 #[derive(Debug, Clone, Display, From)]
 #[strum(serialize_all = "snake_case")]
@@ -45,6 +44,7 @@ pub enum Operator {
     Filter(Filter),
     DynamicScan(DynamicScan),
     Aggregate(Aggregate),
+    PrefixSum(PrefixSum),
 
     // === Binary operators (2 inputs) =========================================
     SemiJoin(SemiJoin),
@@ -52,9 +52,10 @@ pub enum Operator {
     // === N-ary operators (variable inputs) ===================================
     UnionAll(UnionAll),
     WriteJson(WriteJson),
+    WriteParquet(WriteParquet),
 }
 
-/// Output schema of [`WriteJson`]: the file's fully qualified `location`,
+/// File metadata returned by [`WriteJson`] and [`WriteParquet`]: the fully qualified `location`,
 /// `size` in bytes, and `last_modified` in milliseconds since the Unix epoch.
 pub static FILE_META_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     not_null "location": STRING,
@@ -115,6 +116,103 @@ pub struct WriteJson {
     /// unspecified. For example, Delta uses this to write the `commitInfo` action before other
     /// actions in a commit.
     pub ordered: bool,
+}
+
+/// Writes all input rows to one Parquet file and returns file metadata and aggregate statistics.
+///
+/// `write_schema` covers every input column and supplies file metadata, including Parquet field
+/// IDs. Field order, names, types (including nested fields), and nullability must match. The
+/// engine chooses compression and row-group sizing.
+/// The output is [`FILE_META_SCHEMA`] followed by the named `stats_agg` results in list order.
+/// Statistics cover all input rows using the usual [`Agg`] null semantics. Inputs must bind
+/// identical statistics schemas, including metadata.
+///
+/// The atomic-create, overwrite, input ordering, nonempty input, and duplicate-destination
+/// contracts of [`WriteJson`] also apply.
+/// [`PlanBuilder::write_parquet`](crate::PlanBuilder::write_parquet) validates input schemas and
+/// resolves the output schema. Executors must reject invalid `FILE` values before creating or
+/// replacing the destination.
+#[derive(Debug, Clone)]
+pub struct WriteParquet {
+    /// Output schema of the relation containing file descriptors (`location`, `size`,
+    /// `last_modified`) and configured aggregate statistics, resolved by
+    /// [`PlanBuilder::write_parquet`](crate::PlanBuilder::write_parquet).
+    pub output_schema: SchemaRef,
+    /// Named aggregate statistics over all input rows, in output-column order.
+    pub stats_agg: Vec<StatsAgg>,
+    /// Schema of the rows written to Parquet, including Parquet field metadata.
+    pub write_schema: SchemaRef,
+    /// Fully qualified URL of the destination file.
+    pub file_path: Url,
+    /// Whether an existing destination may be replaced.
+    pub overwrite: bool,
+    /// Whether all rows from each input must precede rows from the next input.
+    pub ordered: bool,
+}
+
+impl WriteParquet {
+    /// Configures a single-file write with no statistics, overwrite, or input ordering.
+    pub fn new(write_schema: SchemaRef, file_path: Url) -> Self {
+        Self {
+            output_schema: FILE_META_SCHEMA.clone(),
+            stats_agg: Vec::new(),
+            write_schema,
+            file_path,
+            overwrite: false,
+            ordered: false,
+        }
+    }
+
+    /// Sets the aggregate statistics returned after the file metadata.
+    pub fn with_stats_agg(mut self, stats_agg: impl CollectInto<Vec<StatsAgg>>) -> Self {
+        self.stats_agg = stats_agg.collect_into();
+        self
+    }
+
+    /// Sets whether an existing destination may be replaced.
+    pub fn with_overwrite(mut self, overwrite: bool) -> Self {
+        self.overwrite = overwrite;
+        self
+    }
+
+    /// Sets whether inputs must be written in their declared order.
+    pub fn with_ordered(mut self, ordered: bool) -> Self {
+        self.ordered = ordered;
+        self
+    }
+
+    /// Builds an ungrouped aggregate from the statistics and resolved output schema.
+    pub fn to_aggregate(&self) -> KernelResult<Aggregate> {
+        let (names, aggs): (Vec<_>, Vec<_>) = self
+            .stats_agg
+            .iter()
+            .map(|stats| (stats.name.as_str(), stats.agg.clone()))
+            .unzip();
+        Ok(Aggregate {
+            group_by: vec![],
+            aggs,
+            schema: self.output_schema.project(&names)?,
+        })
+    }
+}
+
+/// A named aggregate statistic produced by [`WriteParquet`].
+#[derive(Debug, Clone)]
+pub struct StatsAgg {
+    /// Output column name.
+    pub name: String,
+    /// Aggregate over all input rows.
+    pub agg: Agg,
+}
+
+impl StatsAgg {
+    /// Names an aggregate statistic.
+    pub fn new(name: impl Into<String>, agg: Agg) -> Self {
+        Self {
+            name: name.into(),
+            agg,
+        }
+    }
 }
 
 /// An engine-assigned identifier for a relation retained by a
@@ -372,7 +470,7 @@ impl Values {
 impl<T: Into<StructData> + ToSchema> FromIterator<T> for Values {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
         let rows = iter.into_iter().map(|row| row.into().into_parts().1);
-        Self::new(Arc::new(T::to_schema()), rows.collect())
+        Self::new(T::schema_ref().clone(), rows.collect())
     }
 }
 
@@ -380,19 +478,15 @@ impl<T: Into<StructData> + ToSchema> FromIterator<T> for Values {
 /// [`TryFrom`].
 impl<T> TryFrom<Values> for Vec<T>
 where
-    T: TryFrom<StructData, Error = KernelError> + ToSchema,
+    T: TryFrom<StructData, Error = KernelError>,
 {
     type Error = KernelError;
 
     fn try_from(Values { schema, rows }: Values) -> KernelResult<Self> {
-        rows.into_iter()
-            .enumerate()
-            .map(|(index, row)| {
-                let schema = schema.as_ref().clone();
-                T::try_from(StructData::from_values_unchecked(schema, row))
-                    .map_err(|error| add_scalar_path_context(error, format!("[{index}]")))
-            })
-            .try_collect()
+        let rows = rows
+            .into_iter()
+            .map(|row| Ok(StructData::from_values_unchecked(Arc::clone(&schema), row)));
+        crate::expressions::struct_rows::decode_rows::<T>(rows).collect()
     }
 }
 
@@ -817,6 +911,8 @@ pub enum Agg {
     Count(ColumnName),
     /// [`Agg::count_star`] has no operands.
     CountStar,
+    /// Operand for [`Agg::first_non_null`].
+    FirstNonNull(ColumnName),
     /// Operands for [`Agg::min_non_null_by`].
     MinNonNullBy(NonNullByOperands),
     /// Operands for [`Agg::max_non_null_by`].
@@ -832,6 +928,15 @@ pub struct NonNullByOperands {
 }
 
 impl Agg {
+    /// Selects the first encountered non-null `value`, or NULL for empty/all-null input.
+    ///
+    /// The result retains the operand's type and is nullable. Struct validity determines
+    /// presence; null children are preserved. Without an ordering contract, the selected row
+    /// may depend on the executor's partition and merge order.
+    pub fn first_non_null(value: impl Into<ColumnName>) -> Self {
+        Self::FirstNonNull(value.into())
+    }
+
     /// Like [`max`](Self::max), but selects the least non-NULL value in each group.
     ///
     /// ```text
@@ -968,7 +1073,7 @@ impl Agg {
 
     /// Derives this aggregate's output [`StructField`] over `input_schema`, validating that every
     /// operand column resolves.
-    fn output_field(
+    pub(crate) fn output_field(
         &self,
         input_schema: &StructType,
         alias: Option<String>,
@@ -990,8 +1095,15 @@ impl Agg {
             })
         };
         match self {
-            Agg::Min(value) | Agg::Max(value) => resolve(value, None, true),
-            Agg::Sum(value) => resolve(value, Some(DataType::LONG), true),
+            Agg::Min(value) | Agg::Max(value) | Agg::FirstNonNull(value) => {
+                resolve(value, None, true)
+            }
+            Agg::Sum(value) => {
+                if input_schema.field_at(value)?.data_type() != &DataType::LONG {
+                    return Err(KernelError::schema("SUM requires a LONG operand"));
+                }
+                resolve(value, Some(DataType::LONG), true)
+            }
             Agg::Count(value) => resolve(value, Some(DataType::LONG), false),
             Agg::CountStar => Ok(StructField::not_null(
                 alias.unwrap_or_else(|| "count".to_string()),
@@ -1021,6 +1133,11 @@ pub struct AggregateBuilder {
 }
 
 impl AggregateBuilder {
+    /// Adds the first non-null `value` to the aggregate output, preserving its name and type.
+    pub fn first_non_null(self, value: impl Into<ColumnName>) -> Self {
+        self.aggregate(Agg::first_non_null(value))
+    }
+
     /// Adds an aggregate column, emitted after the group keys in call order, using each [`Agg`]'s
     /// default output name (see the per-function docs). Prefer the named helpers for the common
     /// case (e.g. [`max`](Self::max); use [`aggregate_as`](Self::aggregate_as) to override the
@@ -1088,7 +1205,8 @@ impl AggregateBuilder {
     /// # Errors
     ///
     /// Returns an error if a group key or an aggregate's operand column is not found in the input
-    /// schema, or if two output columns would share a name (case-insensitive).
+    /// schema, if a sum operand is not LONG, or if two output columns would share a name
+    /// (case-insensitive).
     pub fn build(self) -> KernelResult<Aggregate> {
         let mut fields = Vec::with_capacity(self.group_by.len() + self.aggs.len());
         for key in &self.group_by {
@@ -1113,6 +1231,100 @@ impl TryFrom<AggregateBuilder> for Aggregate {
 
     fn try_from(builder: AggregateBuilder) -> KernelResult<Self> {
         builder.build()
+    }
+}
+
+/// Exclusive prefix sum of one LONG input column, appended as a new output column with the same
+/// nullability as the input (respecting parent column nullability). All other input columns pass
+/// through unchanged.
+///
+/// # Semantics
+///
+/// The output for row `i` is `SUM(input[0..i])`, or `0` for `i=0`. NULL inputs do not contribute
+/// and produce NULL outputs for their respective rows. Zero-valued inputs are valid but produce
+/// duplicate outputs (because they do not increase the value of the sum). Input rows are consumed
+/// exactly once in any order and output rows can be produced in any order.
+///
+/// # Output schema
+///
+/// `schema` is the input schema with one appended LONG column named `output`. That column's
+/// nullability is true if the `input` field or any of its ancestor structs is nullable.
+///
+/// # Example
+///
+/// ```text
+/// PrefixSum { input: numRecords, output: offset, schema: { path, numRecords, offset } }
+/// ```
+///
+/// One valid output (encounter order):
+///
+/// ```text
+/// path | numRecords | offset
+/// -----+------------+-------
+///  a   |         10 |      0
+///  b   |       NULL |   NULL
+///  c   |          0 |     10
+///  d   |          0 |     10
+///  e   |          5 |     10
+///  f   |         20 |     15
+/// ```
+/// This produces the ranges `[0..10, 10..10, 10..10, 10..15, 15..35]`.
+///
+/// Another valid output (input and output rows both permuted):
+///
+/// ```text
+/// path | numRecords | offset
+/// -----+------------+-------
+///  b   |       NULL |   NULL
+///  f   |         20 |     0
+///  a   |         10 |     25
+///  d   |          0 |     20
+///  c   |          0 |     25
+///  e   |          5 |     20
+/// ```
+/// This produces the ranges `[0..20, 20..20, 20..25, 25..25, 25..35]`.
+#[derive(Debug, Clone)]
+pub struct PrefixSum {
+    /// LONG column to accumulate. May be nested (e.g. `stats.numRecords`).
+    pub input: ColumnName,
+    /// Name of the new top-level LONG column holding exclusive prefixes.
+    pub output: String,
+    /// Input schema with [`Self::output`] appended.
+    pub schema: SchemaRef,
+}
+
+impl PrefixSum {
+    /// Builds a [`PrefixSum`] that appends exclusive prefixes of `input` as `output`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `input` is absent from `input_schema`, is not LONG, or if appending
+    /// `output` would duplicate a top-level field name (case-insensitive).
+    pub fn try_new(
+        input_schema: &StructType,
+        input: impl Into<ColumnName>,
+        output: impl Into<String>,
+    ) -> KernelResult<Self> {
+        let input = input.into();
+        let output = output.into();
+        let fields = input_schema.fields_of_path(&input)?;
+        let field = fields[fields.len() - 1];
+        if field.data_type() != &DataType::LONG {
+            return Err(KernelError::generic(format!(
+                "prefix sum: input `{input}` must be LONG, got {}",
+                field.data_type()
+            )));
+        }
+        let schema = Arc::new(input_schema.add([StructField::new(
+            output.clone(),
+            DataType::LONG,
+            fields.iter().any(|field| field.nullable),
+        )])?);
+        Ok(Self {
+            input,
+            output,
+            schema,
+        })
     }
 }
 
@@ -1199,7 +1411,7 @@ mod tests {
 
     use super::*;
     use crate::expressions::column_name;
-    use crate::schema::{schema_ref, DataType, MetadataValue, StructField};
+    use crate::schema::{DataType, MetadataValue, StructField, schema, schema_ref};
     use crate::unit_test_utils::assert_result_error_with_message;
 
     /// Builds a flat `LONG` schema from `(name, nullable)` pairs.
@@ -1421,5 +1633,71 @@ mod tests {
             Vec::<Person>::try_from(values),
             "[0].id: expected i32, found string",
         );
+    }
+    #[rstest::rstest]
+    #[case::top_level(column_name!("numRecords"), false)]
+    #[case::non_null_parent(column_name!("required.numRecords"), false)]
+    #[case::nullable_parent(column_name!("optional.numRecords"), true)]
+    #[case::non_null_ancestors(column_name!("required.required.numRecords"), false)]
+    #[case::nullable_parent_under_non_null_ancestor(
+        column_name!("required.optional.numRecords"), true
+    )]
+    #[case::nullable_ancestor_over_non_null_parent(
+        column_name!("optional.required.numRecords"), true
+    )]
+    #[case::nullable_ancestors(column_name!("optional.optional.numRecords"), true)]
+    fn prefix_sum_appends_long_output_matching_path_nullability(
+        #[case] column: ColumnName,
+        #[case] ancestor_nullable: bool,
+        #[values(true, false)] leaf_nullable: bool,
+    ) {
+        let field = StructField::new("numRecords", DataType::LONG, leaf_nullable);
+        let leaf = schema! { (field.clone()), };
+        let nested = schema! {
+            (field.clone()),
+            not_null "required": (leaf.clone()),
+            nullable "optional": (leaf),
+        };
+        let input = schema_ref! {
+            not_null "path": STRING,
+            (field),
+            not_null "required": (nested.clone()),
+            nullable "optional": (nested),
+        };
+        let prefix = PrefixSum::try_new(input.as_ref(), column.clone(), "offset").unwrap();
+        let names: Vec<&str> = prefix.schema.fields().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            names,
+            ["path", "numRecords", "required", "optional", "offset"]
+        );
+        let offset = prefix.schema.field("offset").unwrap();
+        assert_eq!(offset.data_type(), &DataType::LONG);
+        assert_eq!(offset.nullable, leaf_nullable || ancestor_nullable);
+        assert_eq!(prefix.output, "offset");
+        assert_eq!(prefix.input, column);
+    }
+
+    #[test]
+    fn prefix_sum_rejects_non_long_input() {
+        let input = Arc::new(StructType::new_unchecked([StructField::not_null(
+            "s",
+            DataType::STRING,
+        )]));
+        let result = PrefixSum::try_new(input.as_ref(), column_name!("s"), "off");
+        assert_result_error_with_message(result, "must be LONG");
+    }
+
+    #[test]
+    fn prefix_sum_rejects_missing_input_column() {
+        let input = schema(&[("n", true)]);
+        let result = PrefixSum::try_new(input.as_ref(), column_name!("missing"), "off");
+        assert_result_error_with_message(result, "missing");
+    }
+
+    #[test]
+    fn prefix_sum_rejects_duplicate_output_name() {
+        let input = schema(&[("n", true)]);
+        let result = PrefixSum::try_new(input.as_ref(), column_name!("n"), "n");
+        assert_result_error_with_message(result, "Duplicate field name");
     }
 }

@@ -25,7 +25,7 @@ use std::num::NonZero;
 
 use error::{LogHistoryError, NearestTimestamp};
 use itertools::Itertools;
-use search::{binary_search_by_key_with_bounds, Bound, SearchError};
+use search::{Bound, SearchError, binary_search_by_key_with_bounds};
 use tracing::{info, trace, warn};
 use url::Url;
 
@@ -126,7 +126,7 @@ fn get_timestamp_search_bounds(
 
     let (ict_enablement_version, ict_timestamp) = match ict_enablement {
         InCommitTimestampEnablement::NotEnabled => {
-            return Ok(TimestampSearchBounds::FileModificationSearch)
+            return Ok(TimestampSearchBounds::FileModificationSearch);
         }
         InCommitTimestampEnablement::Enabled {
             enablement: Some((v, t)),
@@ -238,9 +238,7 @@ fn linear_search_file_mod_timestamps(
         if monotonic_ts != raw_ts {
             trace!(
                 version = commit.version,
-                raw_ts,
-                monotonic_ts,
-                "Adjusted non-monotonic timestamp"
+                raw_ts, monotonic_ts, "Adjusted non-monotonic timestamp"
             );
         }
 
@@ -252,7 +250,7 @@ fn linear_search_file_mod_timestamps(
             Bound::GreatestLower => break,
             // LeastUpper: return version upon first match
             Bound::LeastUpper if monotonic_ts >= timestamp => {
-                return Ok(CommitAt::new(commit.version, monotonic_ts))
+                return Ok(CommitAt::new(commit.version, monotonic_ts));
             }
             Bound::LeastUpper => {}
         }
@@ -387,6 +385,7 @@ pub(crate) fn timestamp_to_version(
     // Short-circuit: compare against snapshot's timestamp to avoid log segment rebuild.
     // This optimization mirrors Delta Spark and Java Kernel behavior.
     let snap_ts = snapshot
+        .reader()
         .get_timestamp(engine)
         .map_err(|e| LogHistoryError::internal("failed to get snapshot timestamp", e))?;
     match (timestamp.cmp(&snap_ts), bound) {
@@ -394,7 +393,7 @@ pub(crate) fn timestamp_to_version(
         (Ordering::Equal, _) => return Ok(CommitAt::new(snapshot.version(), snap_ts)),
         // Timestamp after snapshot: for GreatestLower, snapshot is the answer
         (Ordering::Greater, Bound::GreatestLower) => {
-            return Ok(CommitAt::new(snapshot.version(), snap_ts))
+            return Ok(CommitAt::new(snapshot.version(), snap_ts));
         }
         // Timestamp after snapshot: for LeastUpper, no version exists
         (Ordering::Greater, Bound::LeastUpper) => {
@@ -526,7 +525,11 @@ pub(crate) fn timestamp_to_version(
 /// let timestamp = 1672531200000; // Milliseconds since epoch for 2023-01-01
 /// let commit = latest_version_as_of(&snapshot, &engine, timestamp, HistoryCommitType::Recreatable)?;
 /// ```
-#[tracing::instrument(skip(snapshot, engine), ret, fields(latest_version = snapshot.version(), table_root = %snapshot.table_root()))]
+#[tracing::instrument(
+    skip(snapshot, engine),
+    ret,
+    fields(enable_call_frame, latest_version = snapshot.version(), table_root = %snapshot.table_root())
+)]
 pub fn latest_version_as_of(
     snapshot: &Snapshot,
     engine: &dyn Engine,
@@ -567,7 +570,11 @@ pub fn latest_version_as_of(
 /// let timestamp = 1672531200000; // Milliseconds since epoch for 2023-01-01
 /// let commit = first_version_after(&snapshot, &engine, timestamp, HistoryCommitType::Recreatable)?;
 /// ```
-#[tracing::instrument(skip(snapshot, engine), ret, fields(latest_version = snapshot.version(), table_root = %snapshot.table_root()))]
+#[tracing::instrument(
+    skip(snapshot, engine),
+    ret,
+    fields(enable_call_frame, latest_version = snapshot.version(), table_root = %snapshot.table_root())
+)]
 pub fn first_version_after(
     snapshot: &Snapshot,
     engine: &dyn Engine,
@@ -627,7 +634,11 @@ pub fn first_version_after(
 /// let (start_version, end_version) =
 ///     timestamp_range_to_versions(&snapshot, &engine, start_timestamp, Some(end_timestamp))?;
 /// ```
-#[tracing::instrument(skip(snapshot, engine), ret, fields(latest_version = snapshot.version(), table_root = %snapshot.table_root()))]
+#[tracing::instrument(
+    skip(snapshot, engine),
+    ret,
+    fields(enable_call_frame, latest_version = snapshot.version(), table_root = %snapshot.table_root())
+)]
 pub fn timestamp_range_to_versions(
     snapshot: &Snapshot,
     engine: &dyn Engine,
@@ -787,14 +798,14 @@ fn get_earliest_recreatable_commit(
                 let earliest_version =
                     *earliest_commit_version.get_or_insert(parsed_log_path.version);
 
-                if let Some(checkpoint_version) = last_complete_checkpoint {
-                    if checkpoint_version >= earliest_version {
-                        // Given the contiguity assumption of delta_log commits,
-                        // when a full checkpoint has contiguous commits starting before or at
-                        // checkpoint_version that table can be
-                        // recreated at checkpoint_version.
-                        return Ok(checkpoint_version);
-                    }
+                if let Some(checkpoint_version) = last_complete_checkpoint
+                    && checkpoint_version >= earliest_version
+                {
+                    // Given the contiguity assumption of delta_log commits,
+                    // when a full checkpoint has contiguous commits starting before or at
+                    // checkpoint_version that table can be
+                    // recreated at checkpoint_version.
+                    return Ok(checkpoint_version);
                 }
             }
             LogPathFileType::ClassicCheckpoint | LogPathFileType::UuidCheckpoint => {
@@ -875,7 +886,7 @@ pub enum HistoryCommitType {
 /// - [`DeltaError::Generic`] when the listing yields no commits and
 ///   `earliest_ratified_commit_version` is `Some(0)`, flagging a broken catalog-managed invariant
 ///   (ratified commit 0 with no published filesystem commit).
-#[tracing::instrument(skip(engine), err, ret)]
+#[tracing::instrument(skip(engine), err, ret, fields(enable_call_frame))]
 pub fn get_earliest_commit(
     engine: &dyn Engine,
     log_root: &Url,
@@ -898,10 +909,10 @@ pub fn get_earliest_commit(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::fs::{remove_file, OpenOptions};
+    use std::fs::{OpenOptions, remove_file};
     use std::ops::RangeInclusive;
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::time::{Duration, SystemTime};
 
     use bytes::Bytes;
@@ -912,10 +923,8 @@ mod tests {
     use super::*;
     use crate::actions::{CommitInfo, Metadata, Protocol};
     use crate::engine::sync::SyncEngine;
-    use crate::engine::test_delegating::DelegatingEngine;
-    use crate::engine::CancellableEngine;
-    use crate::object_store::memory::InMemory;
-    use crate::schema::{schema_ref, SchemaRef};
+    use crate::engine::{CancellableEngine, DelegatingEngine};
+    use crate::schema::{SchemaRef, schema_ref};
     use crate::snapshot::{Snapshot, SnapshotBuilder};
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::{Action, LocalMockTable, TestCancellationToken};
@@ -1960,7 +1969,9 @@ mod tests {
             (Ok(p), Ok(r)) => assert_eq!(p, r, "diverged at ts={timestamp} bound={bound:?}"),
             (Err(_), Err(_)) => {}
             (p, r) => {
-                panic!("Published and Recreatable diverged at ts={timestamp} bound={bound:?}: {p:?} vs {r:?}")
+                panic!(
+                    "Published and Recreatable diverged at ts={timestamp} bound={bound:?}: {p:?} vs {r:?}"
+                )
             }
         }
     }
@@ -2063,7 +2074,7 @@ mod tests {
     /// an engine wired to it plus the corresponding `_delta_log/` URL. Paths listed in
     /// `empty_paths` are written as 0-byte files to exercise empty-file skipping.
     fn engine_with_log_files(paths: &[String], empty_paths: &HashSet<String>) -> (SyncEngine, Url) {
-        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let engine = SyncEngine::in_memory();
         let storage = engine.storage_handler();
         for path in paths {
             let bytes = if empty_paths.contains(path) {

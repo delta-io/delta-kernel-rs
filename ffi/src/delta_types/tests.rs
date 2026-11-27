@@ -4,7 +4,7 @@ use rstest::rstest;
 use test_utils::assert_result_error_with_message;
 
 use super::*;
-use crate::{optional_pointer, FfiFileStats, KernelI64Slice, KernelStringSlice, OptionalValue};
+use crate::{FfiFileStats, KernelI64Slice, KernelStringSlice, OptionalValue, optional_pointer};
 
 #[rstest]
 #[case(HashMap::new())]
@@ -483,10 +483,12 @@ fn typed_crc_accepts_full_kernel_state() {
         },
         ..empty_crc()
     };
-    assert!(unsafe { indeterminate.try_to_kernel() }
-        .unwrap()
-        .file_stats()
-        .is_none());
+    assert!(
+        unsafe { indeterminate.try_to_kernel() }
+            .unwrap()
+            .file_stats()
+            .is_none()
+    );
 }
 
 #[test]
@@ -612,14 +614,18 @@ fn typed_arrays_preserve_absent_and_present_empty() {
         ..empty_crc()
     };
     let parsed_crc = unsafe { crc_value.try_to_kernel() }.unwrap();
-    assert!(parsed_crc
-        .set_transaction_state
-        .expect_complete()
-        .is_empty());
-    assert!(parsed_crc
-        .domain_metadata_state
-        .expect_complete()
-        .is_empty());
+    assert!(
+        parsed_crc
+            .set_transaction_state
+            .expect_complete()
+            .is_empty()
+    );
+    assert!(
+        parsed_crc
+            .domain_metadata_state
+            .expect_complete()
+            .is_empty()
+    );
 }
 
 #[test]

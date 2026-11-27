@@ -12,7 +12,7 @@
 //! Delta metadata contains today. If the supported SQL surface grows, options include moving
 //! parsing behind the [`Engine`](crate::Engine) trait or adopting an existing SQL parser library.
 
-use crate::expressions::{lit, null_lit, Expression, Scalar};
+use crate::expressions::{Expression, Scalar, lit, null_lit};
 use crate::schema::{DataType, PrimitiveType};
 use crate::{KernelError, KernelResult};
 
@@ -279,7 +279,7 @@ fn unquote_string(input: &str) -> KernelResult<String> {
             Some(_) => {
                 return Err(KernelError::generic(format!(
                     "unexpected characters after closing quote in SQL string literal: {input}"
-                )))
+                )));
             }
         }
     }
@@ -348,7 +348,7 @@ mod tests {
 
     use super::*;
     use crate::expressions::{DecimalData, Expression};
-    use crate::schema::{schema, ArrayType, DataType, DecimalType, MapType};
+    use crate::schema::{ArrayType, DataType, DecimalType, MapType, schema};
 
     fn date_days(year: i32, month: u32, day: u32) -> i32 {
         let nd = NaiveDate::from_ymd_opt(year, month, day)
@@ -459,7 +459,7 @@ mod tests {
     #[case("TIMESTAMP '2024-01-01 12:34:56'", "zoneless")]
     #[case("'2024-06-15T14:30:00+05:00'", "offset")]
     #[case("'2024-06-15T14:30:00+00:00'", "offset")] // +00:00 is UTC-valued but dropped, so
-                                                     // rejected
+    // rejected
     fn timestamp_ltz_rejection_distinguishes_zoneless_from_offset(
         #[case] sql: &str,
         #[case] needle: &str,
@@ -493,7 +493,7 @@ mod tests {
     #[case("TIMESTAMP_NTZ '1970-01-01T00:00:00Z'", DataType::TIMESTAMP)] // NTZ keyword, LTZ target
     #[case("TIMESTAMP '2024-01-01 12:34:56'", DataType::TIMESTAMP_NTZ)] // LTZ keyword, NTZ target
     #[case("TIMESTAMP_LTZ '1970-01-01T00:00:00Z'", DataType::TIMESTAMP_NTZ)] // LTZ keyword, NTZ
-                                                                             // target
+    // target
     fn rejects_mismatched_timestamp_keyword(#[case] sql: &str, #[case] ty: DataType) {
         let result = parse_sql(sql, &ty);
         assert!(
@@ -511,7 +511,7 @@ mod tests {
     #[case("TIMESTAMP '2024-06-15T14:30:00.456Z'", "2024-06-15 14:30:00.456")]
     #[case("TIMESTAMP_LTZ '2024-06-15T14:30:00Z'", "2024-06-15 14:30:00")] // explicit LTZ spelling
     #[case("TIMESTAMP_LTZ'1970-01-01T00:00:00.123Z'", "1970-01-01 00:00:00.123")] // butted against
-                                                                                  // quote
+    // quote
     fn iso_8601_form_accepted_only_for_timestamp(#[case] sql: &str, #[case] equivalent: &str) {
         let got = parse_sql(sql, &DataType::TIMESTAMP).unwrap();
         assert_eq!(got, lit(Scalar::Timestamp(ts_micros(equivalent))));

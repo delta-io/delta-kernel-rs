@@ -9,7 +9,7 @@ use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorSt
 use crate::actions::{Metadata, Protocol};
 use crate::path::ParsedLogPath;
 use crate::schema::SchemaRef;
-use crate::table_changes::log_replay::{table_changes_action_iter, TableChangesScanMetadata};
+use crate::table_changes::log_replay::{TableChangesScanMetadata, table_changes_action_iter};
 use crate::table_changes::{CdfMode, TableChangesReadConfiguration};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
@@ -18,7 +18,7 @@ use crate::table_properties::{
     MATERIALIZED_ROW_ID_COLUMN_NAME,
 };
 use crate::unit_test_utils::{Action, MockTableConfigurationBuilder};
-use crate::{Engine, KernelResult, KernelResultIterator, PredicateRef};
+use crate::{Engine, PredicateRef, Result};
 
 pub(crate) const TEST_MATERIALIZED_ROW_ID_COLUMN_NAME: &str = "_row_id";
 pub(crate) const TEST_MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME: &str = "_row_commit_version";
@@ -68,14 +68,18 @@ pub(crate) fn row_tracking_table_config(table_root: Url, schema: SchemaRef) -> T
 /// Replays commits with a read configuration fixed to mapping mode `None` and no partition
 /// columns. Tests for per-commit mapping or partition-layout validation must construct a real
 /// `TableChangesReadConfiguration` instead.
-pub(crate) fn replay_unmapped_unpartitioned_table_changes(
+pub(crate) fn replay_unmapped_unpartitioned_table_changes<I>(
     engine: Arc<dyn Engine>,
     start_table_configuration: &TableConfiguration,
-    commit_files: impl IntoIterator<Item = ParsedLogPath, IntoIter: Send>,
+    commit_files: I,
     read_schema: SchemaRef,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
     mode: CdfMode,
-) -> KernelResult<impl KernelResultIterator<TableChangesScanMetadata>> {
+) -> Result<impl Iterator<Item = Result<TableChangesScanMetadata>> + Send + use<I>>
+where
+    I: IntoIterator<Item = ParsedLogPath>,
+    I::IntoIter: Send,
+{
     let read_configuration =
         TableChangesReadConfiguration::new_unmapped_unpartitioned_for_test(read_schema);
     table_changes_action_iter(

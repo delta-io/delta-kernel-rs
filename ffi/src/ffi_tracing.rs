@@ -23,16 +23,16 @@ use delta_kernel::metrics::{
 };
 use delta_kernel::{KernelError, KernelResult};
 use tracing::field::{Field as TracingField, Visit};
-use tracing::{error, Event as TracingEvent, Subscriber};
+use tracing::{Event as TracingEvent, Subscriber, error};
 use tracing_core::Dispatch;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::{Context, Identity, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
-use tracing_subscriber::{reload, Layer, Registry};
+use tracing_subscriber::{Layer, Registry, reload};
 
-use crate::ffi_metrics::{with_ffi_event, MetricEvent};
-use crate::{kernel_string_slice, KernelStringSlice};
+use crate::ffi_metrics::{MetricEvent, with_ffi_event};
+use crate::{KernelStringSlice, OptionalValue, kernel_string_slice};
 
 /// A type-erased logging layer that lives in the reloadable logging slot of the global subscriber.
 /// cbindgen:ignore
@@ -122,9 +122,34 @@ pub type TracingEventFn = extern "C" fn(event: Event);
 ///
 /// # Safety
 /// Caller must pass a valid function pointer for the callback
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn enable_event_tracing(callback: TracingEventFn, max_level: Level) -> bool {
     setup_event_subscriber(callback, max_level).is_ok()
+}
+
+/// Changes the shared logging filter without replacing its callback or format.
+///
+/// Pass `Some(level)` to enable logging up to that level, or `None` to disable it. Metrics and
+/// call-frame reporting retain their own filters. Returns false if the subscriber has not been
+/// initialized or the filter cannot be updated. This function does not install a logging callback.
+///
+/// A call to [`enable_event_tracing`], [`enable_log_line_tracing`], or
+/// [`enable_formatted_log_line_tracing`] replaces this level with its own `max_level`.
+///
+/// Concurrent calls are serialized. Do not call this synchronously from a tracing callback.
+#[unsafe(no_mangle)]
+pub extern "C" fn set_event_tracing_level(max_level: OptionalValue<Level>) -> bool {
+    let Ok(state) = TRACING_STATE.lock() else {
+        return false;
+    };
+    let Some(filter) = &state.logging_filter else {
+        return false;
+    };
+    let level = match max_level {
+        OptionalValue::Some(level) => LevelFilter::from(level),
+        OptionalValue::None => LevelFilter::OFF,
+    };
+    filter.reload(level).is_ok()
 }
 
 pub type TracingLogLineFn = extern "C" fn(line: KernelStringSlice);
@@ -187,7 +212,7 @@ pub enum LogLineFormat {
 ///
 /// # Safety
 /// Caller must pass a valid function pointer for the callback
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn enable_log_line_tracing(
     callback: TracingLogLineFn,
     max_level: Level,
@@ -223,7 +248,7 @@ pub unsafe extern "C" fn enable_log_line_tracing(
 ///
 /// # Safety
 /// Caller must pass a valid function pointer for the callback
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn enable_formatted_log_line_tracing(
     callback: TracingLogLineFn,
     max_level: Level,
@@ -681,7 +706,7 @@ fn setup_log_line_subscriber(
 ///
 /// # Safety
 /// Caller must pass a valid function pointer for the callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn enable_metrics_reporting(callback: MetricsEventFn) -> bool {
     setup_metrics_reporter(callback).is_ok()
 }
@@ -710,7 +735,7 @@ fn setup_metrics_reporter(callback: MetricsEventFn) -> KernelResult<()> {
 ///
 /// The caller must pass a valid function pointer. The callback must not unwind across the FFI
 /// boundary and must copy the OPEN event's name before returning if it needs to retain it.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn enable_frame_reporting(callback: FrameEventFn) -> bool {
     TRACING_STATE
         .lock()
@@ -722,6 +747,7 @@ pub unsafe extern "C" fn enable_frame_reporting(callback: FrameEventFn) -> bool 
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::process::Command;
 
     use tracing::field::Empty;
     use tracing::{debug, info, trace};
@@ -894,10 +920,8 @@ mod tests {
     #[test]
     fn test_enable_log_line_tracing() {
         setup_messages();
-        unsafe {
-            // record_callback_with_filter_1 filters only "Testing 1\n", "Another line\n"
-            enable_log_line_tracing(record_callback_with_filter_1, Level::INFO);
-        }
+        // record_callback_with_filter_1 filters only "Testing 1\n", "Another line\n"
+        unsafe { enable_log_line_tracing(record_callback_with_filter_1, Level::INFO) };
         let lines = [
             "Testing 1\n",
             "Another line\n",
@@ -985,12 +1009,11 @@ mod tests {
     }
 
     fn events_to_string(events: Vec<(String, tracing::Level)>) -> String {
-        let events_str = events
+        events
             .iter()
             .map(|(s, lvl)| format!("{s}:{lvl}"))
             .collect::<Vec<_>>()
-            .join(", ");
-        events_str
+            .join(", ")
     }
 
     fn convert_level(level: Level) -> tracing::Level {
@@ -1068,13 +1091,11 @@ mod tests {
 
     #[test]
     #[ignore] // We cannot run this test if test_enable_log_line_tracing was run before - see
-              // comment there, however this test works if run individually.
+    // comment there, however this test works if run individually.
     fn test_enable_event_tracing() {
         setup_events();
-        unsafe {
-            // Filters only "Testing 1", "Another line"
-            enable_event_tracing(event_callback_with_filter_1, Level::INFO);
-        }
+        // Filters only "Testing 1", "Another line"
+        unsafe { enable_event_tracing(event_callback_with_filter_1, Level::INFO) };
         let lines = ["Testing 1", "Another line", "Testing 2", "Yet another line"];
         // We registered record_callback_with_filter_1, which filters the first two logging lines
         let expected_lines = vec!["Testing 1", "Another line"];
@@ -1087,9 +1108,7 @@ mod tests {
         with_events(|events| assert!(events.is_none_or(|events| events.is_empty())));
 
         // Ensure we can setup again with a new callback and a new tracing level
-        unsafe {
-            enable_event_tracing(event_callback_with_filter_2, Level::DEBUG);
-        };
+        unsafe { enable_event_tracing(event_callback_with_filter_2, Level::DEBUG) };
 
         // Ensure both callback and tracing level are reloaded.
         // We registered record_callback_with_filter_2, which filters the other logging lines
@@ -1200,6 +1219,69 @@ mod tests {
     fn emit_reloadable_frame_span() {
         let span = tracing::trace_span!("reloadable", enable_call_frame = Empty);
         let _guard = span.enter();
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot spawn subprocesses")]
+    fn event_tracing_level_updates_keep_frames_enabled() {
+        const CHILD: &str = "DELTA_KERNEL_LOG_LEVEL_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "ffi_tracing::tests::event_tracing_level_updates_keep_frames_enabled",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                stdout.contains("test result: ok. 1 passed;"),
+                "child did not run exactly one test:\n{stdout}"
+            );
+            return;
+        }
+
+        assert!(!set_event_tracing_level(OptionalValue::Some(Level::TRACE)));
+        setup_event_subscriber(event_callback_with_filter_1, Level::ERROR).unwrap();
+        setup_metrics_reporter(capture_metric_event).unwrap();
+        TRACING_STATE
+            .lock()
+            .unwrap()
+            .register_frame_callback(capture_frame_event)
+            .unwrap();
+        for (level, expected) in [
+            (OptionalValue::None, 0),
+            (OptionalValue::Some(Level::WARN), 2),
+            (OptionalValue::Some(Level::DEBUG), 4),
+            (OptionalValue::Some(Level::TRACE), 5),
+            (OptionalValue::Some(Level::ERROR), 1),
+            (OptionalValue::None, 0),
+            (OptionalValue::Some(Level::INFO), 3),
+        ] {
+            assert!(set_event_tracing_level(level));
+            setup_events();
+            tracing::error!("Testing 1");
+            tracing::warn!("Testing 1");
+            info!("Testing 1");
+            debug!("Testing 1");
+            trace!("Testing 1");
+            with_events(|events| assert_eq!(events.unwrap().len(), expected));
+            let frames = capture_frame_events(emit_reloadable_frame_span);
+            assert_eq!(frames.len(), 2);
+            assert!(frames[0].is_open);
+            assert!(!frames[1].is_open);
+            assert_eq!(frames[0].span_id, frames[1].span_id);
+            METRIC_EVENTS.with(|events| *events.borrow_mut() = Some(vec![]));
+            delta_kernel::metrics::emit_json_read_completed(3, 100);
+            with_metric_events(|events| assert_eq!(events.unwrap(), ["json:3:100"]));
+        }
     }
 
     #[test]

@@ -5,18 +5,18 @@ use std::sync::{Arc, LazyLock};
 use clap::{Parser, Subcommand};
 use common::{LocationArgs, ParseWithExamples};
 use delta_kernel::actions::visitors::{
-    visit_metadata_at, visit_protocol_at, AddVisitor, CdcVisitor, RemoveVisitor,
-    SetTransactionVisitor, SidecarVisitor,
+    AddVisitor, CdcVisitor, RemoveVisitor, SetTransactionVisitor, SidecarVisitor,
+    visit_metadata_at, visit_protocol_at,
 };
 use delta_kernel::actions::{
-    get_all_actions_schema, ADD_NAME, CDC_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
-    SET_TRANSACTION_NAME, SIDECAR_NAME,
+    ADD_NAME, CDC_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME,
+    SIDECAR_NAME, get_all_actions_schema,
 };
 use delta_kernel::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use delta_kernel::expressions::ColumnName;
 use delta_kernel::metrics::{LoggingMetricsReporter, WithMetricsReporterLayer};
-use delta_kernel::scan::state::ScanFile;
 use delta_kernel::scan::ScanBuilder;
+use delta_kernel::scan::state::ScanFile;
 use delta_kernel::schema::{ColumnNamesAndTypes, DataType};
 use delta_kernel::{KernelError, KernelResult, Snapshot};
 use tracing_subscriber::layer::SubscriberExt as _;
@@ -195,7 +195,7 @@ fn print_scan_file(_: &mut (), file: ScanFile) {
     );
 }
 
-fn try_main() -> KernelResult<()> {
+fn try_main() -> delta_kernel::Result<()> {
     let cli = Cli::parse_with_examples(env!("CARGO_PKG_NAME"), "Inspect", "inspect", "<COMMAND>");
 
     let url = delta_kernel::try_parse_uri(&cli.location_args.path)?;

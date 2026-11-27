@@ -12,22 +12,20 @@ use crate::arrow::array::{Int32Array, StringArray};
 use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_data::EngineDataArrowExt;
 use crate::engine::sync::SyncEngine;
-use crate::engine::test_delegating::DelegatingEngine;
-use crate::engine::CancellableEngine;
+use crate::engine::{CancellableEngine, DelegatingEngine};
 use crate::metrics::{MeteredDeltaEngine, MetricEvent};
-use crate::object_store::memory::InMemory;
-use crate::schema::{schema_ref, ColumnName};
+use crate::schema::{ColumnName, schema_ref};
 use crate::transaction::create_table::create_table;
 use crate::transaction::data_layout::DataLayout;
 use crate::unit_test_utils::recording_reads::{Read, RecordingReads};
 use crate::unit_test_utils::{
-    install_thread_local_metrics_reporter, string_array_to_engine_data, CapturingReporter,
-    TestCancellationToken,
+    CapturingReporter, TestCancellationToken, install_thread_local_metrics_reporter,
+    string_array_to_engine_data,
 };
 use crate::utils::try_parse_uri;
 use crate::{
-    CancellationTokenRef, Engine, EngineData, FileMeta, FileSlice, FilteredEngineData, KernelError,
-    KernelResult, KernelResultIterator, Snapshot, StorageHandler,
+    CancellationTokenRef, Engine, EngineData, Error, FileMeta, FileSlice, FilteredEngineData,
+    KernelError, KernelResult, KernelResultIterator, Snapshot, SnapshotReader, StorageHandler,
 };
 
 /// Handler entry point selected for a read.
@@ -63,12 +61,12 @@ fn start_read(
     let schema = LOG_METADATA_SCHEMA.clone();
     match (read, api) {
         (Read::List, ReadApi::Default) => {
-            discard_read_values(engine.storage_handler().list_from(&path))
+            discard_read_values(engine.storage_handler().list_from(&path, None))
         }
         (Read::List, ReadApi::WithCancellation) => discard_read_values(
             engine
                 .storage_handler()
-                .list_from_with_cancellation(&path, token),
+                .list_from_with_cancellation(&path, None, token),
         ),
         (Read::Hint | Read::Crc, ReadApi::Default) => discard_read_values(
             engine
@@ -255,7 +253,10 @@ fn cancelled_snapshot_reports_correlated_failure_with_metered_handlers(
     let result = Snapshot::builder_for(format!("tests/data/{table}"))
         .with_correlation_id("cancelled-snapshot")
         .build(engine.as_ref());
-    assert!(matches!(result, Err(KernelError::Cancelled)), "{result:?}");
+    assert!(
+        matches!(result, Err(Error::Kernel(KernelError::Cancelled))),
+        "{result:?}"
+    );
 
     let events = reporter.events();
     let failure = events
@@ -284,9 +285,11 @@ fn cancelled_snapshot_reports_correlated_failure_with_metered_handlers(
         Some((failure.operation_id, Some("cancelled-snapshot"))),
         "{events:?}"
     );
-    assert!(!events
-        .iter()
-        .any(|event| matches!(event, MetricEvent::SnapshotBuildSuccess(_))));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, MetricEvent::SnapshotBuildSuccess(_)))
+    );
 }
 
 /// Checks nested read overrides, cumulative HEAD preflight, and unscoped storage writes.
@@ -381,7 +384,8 @@ struct RecordingCopy {
 
 impl StorageHandler for RecordingCopy {
     forward_methods! {
-        fn list_from(path: &Url) -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>>;
+        fn list_from(path: &Url, end: Option<&Url>)
+            -> KernelResult<Box<dyn KernelResultIterator<FileMeta>>>;
         fn read_files(files: Vec<FileSlice>) -> KernelResult<Box<dyn KernelResultIterator<Bytes>>>;
         fn put(path: &Url, data: Bytes, overwrite: bool) -> KernelResult<()>;
         fn head(path: &Url) -> KernelResult<FileMeta>;
@@ -502,7 +506,7 @@ fn snapshot_reads_keep_builder_token(
     let events = reads.events.lock().unwrap();
     assert!(events.contains(&read));
     if cancel {
-        assert!(matches!(result, Err(KernelError::Cancelled)));
+        assert!(matches!(result, Err(Error::Kernel(KernelError::Cancelled))));
         assert_eq!(events.last(), Some(&read));
     } else if incremental {
         assert_eq!(result.unwrap().version(), 1);
@@ -525,7 +529,7 @@ fn discovery_keeps_builder_token(#[case] read: Read) {
     let result = Snapshot::builder_for("tests/data/table-without-dv-small")
         .with_cancellation_token(token)
         .build(&reads.engine());
-    assert!(matches!(result, Err(KernelError::Cancelled)));
+    assert!(matches!(result, Err(Error::Kernel(KernelError::Cancelled))));
     assert_eq!(reads.events.lock().unwrap().last(), Some(&read));
 }
 
@@ -538,7 +542,7 @@ fn completed_snapshot_does_not_retain_build_scope() {
         Snapshot::builder_for("tests/data/table-without-dv-small")
             .with_cancellation_token(cancelled)
             .build(&engine),
-        Err(KernelError::Cancelled)
+        Err(Error::Kernel(KernelError::Cancelled))
     ));
     let token: CancellationTokenRef = Arc::new(TestCancellationToken::default());
     let weak = Arc::downgrade(&token);
@@ -563,20 +567,34 @@ enum MetadataRead {
     Domain,
     Transaction,
     Clustering,
+    ClusteringInfo,
+    Domains,
+    InternalDomain,
+    UserDomains,
+    RowTracking,
+    Timestamp,
+    InCommitTimestamp,
 }
 
-/// Shares the operation token with lazy domain, transaction, and clustering metadata reads.
+/// Forwards the reader's exact token through each metadata API and preserves unscoped reads.
 #[rstest]
 fn post_build_metadata_reads_inherit_operation_token(
     #[values(
         MetadataRead::Domain,
         MetadataRead::Transaction,
-        MetadataRead::Clustering
+        MetadataRead::Clustering,
+        MetadataRead::ClusteringInfo,
+        MetadataRead::Domains,
+        MetadataRead::InternalDomain,
+        MetadataRead::UserDomains,
+        MetadataRead::RowTracking,
+        MetadataRead::Timestamp,
+        MetadataRead::InCommitTimestamp
     )]
     read: MetadataRead,
     #[values(false, true)] cancelled: bool,
 ) {
-    let original = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+    let original = SyncEngine::in_memory();
     create_table(
         "memory:///",
         schema_ref! { nullable "id": INTEGER },
@@ -585,6 +603,10 @@ fn post_build_metadata_reads_inherit_operation_token(
     )
     .with_domain_metadata("test", "value")
     .with_transaction_id("app", 7)
+    .with_table_properties([
+        ("delta.enableInCommitTimestamps", "true"),
+        ("delta.enableRowTracking", "true"),
+    ])
     .with_data_layout(DataLayout::Clustered {
         columns: vec![ColumnName::new(["id"])],
     })
@@ -595,37 +617,92 @@ fn post_build_metadata_reads_inherit_operation_token(
     .unwrap_committed();
     let mut reads = RecordingReads::new(None);
     Arc::get_mut(&mut reads).unwrap().inner = Arc::new(original);
-    let engine = CancellableEngine::new(&reads.engine(), reads.token.clone());
-    let snapshot = Snapshot::builder_for("memory:///").build(&engine).unwrap();
+    let engine = reads.engine();
+    let snapshot = Snapshot::builder_for("memory:///")
+        .build(reads.inner.as_ref())
+        .unwrap();
     assert!(snapshot.crc_at_version().is_none());
     reads.events.lock().unwrap().clear();
     if cancelled {
         reads.token.cancel();
     }
-    let load = |engine: &dyn Engine| -> KernelResult<()> {
+    let load = |reader: &SnapshotReader<'_>, engine: &dyn Engine| -> KernelResult<()> {
         match read {
             MetadataRead::Domain => assert_eq!(
-                snapshot.get_domain_metadata("test", engine)?,
+                reader.get_domain_metadata("test", engine)?,
                 Some("value".into())
             ),
             MetadataRead::Transaction => {
-                assert_eq!(snapshot.get_app_id_version("app", engine)?, Some(7));
+                assert_eq!(reader.get_app_id_version("app", engine)?, Some(7));
             }
             MetadataRead::Clustering => assert_eq!(
-                snapshot.get_physical_clustering_columns(engine)?,
+                reader.get_physical_clustering_columns(engine)?,
                 Some(vec![ColumnName::new(["id"])])
             ),
+            MetadataRead::ClusteringInfo => {
+                let infos = reader.get_clustering_column_infos(engine)?.unwrap();
+                assert_eq!(infos[0].physical_column, ColumnName::new(["id"]));
+            }
+            MetadataRead::Domains => assert!(
+                reader
+                    .get_domain_metadatas_internal(engine, None)?
+                    .contains_key("test")
+            ),
+            MetadataRead::InternalDomain => assert!(
+                reader
+                    .get_domain_metadata_internal("delta.clustering", engine)?
+                    .is_some()
+            ),
+            MetadataRead::UserDomains => {
+                assert_eq!(reader.get_all_domain_metadata(engine)?.len(), 1)
+            }
+            MetadataRead::RowTracking => assert_eq!(
+                reader.get_row_tracking_high_water_mark(engine)?,
+                Some(crate::ROW_TRACKING_INITIAL_HIGH_WATER_MARK)
+            ),
+            MetadataRead::Timestamp => assert!(reader.get_timestamp(engine)? > 0),
+            MetadataRead::InCommitTimestamp => {
+                assert!(reader.get_in_commit_timestamp(engine)?.is_some())
+            }
         }
         Ok(())
     };
-    let result = load(&engine);
+    let reader = snapshot
+        .reader()
+        .with_cancellation_token(reads.token.clone() as CancellationTokenRef);
+    let result = load(&reader, &engine);
     if cancelled {
         assert!(matches!(result, Err(KernelError::Cancelled)), "{result:?}");
     } else {
         result.unwrap();
     }
     assert_eq!(*reads.events.lock().unwrap(), [Read::Json]);
-    load(reads.inner.as_ref()).unwrap();
+    load(&snapshot.reader(), reads.inner.as_ref()).unwrap();
+}
+
+#[rstest]
+#[case::json_entry("app-txn-no-checkpoint", Read::Json, false)]
+#[case::json_batch("app-txn-no-checkpoint", Read::Json, true)]
+#[case::parquet_entry("app-txn-checkpoint", Read::Parquet, false)]
+fn reader_cancellation_during_replay_persists_across_reads(
+    #[case] table: &str,
+    #[case] boundary: Read,
+    #[case] after_batch: bool,
+) {
+    let mut reads = RecordingReads::new((!after_batch).then_some(boundary));
+    Arc::get_mut(&mut reads).unwrap().cancel_json_after_batch = after_batch;
+    let snapshot = Snapshot::builder_for(format!("tests/data/{table}"))
+        .build(reads.inner.as_ref())
+        .unwrap();
+    let reader = snapshot
+        .reader()
+        .with_cancellation_token(reads.token.clone() as CancellationTokenRef);
+    let result = reader.get_app_id_version("missing-app", &reads.engine());
+    assert!(matches!(result, Err(KernelError::Cancelled)), "{result:?}");
+    assert_eq!(reads.events.lock().unwrap().last(), Some(&boundary));
+
+    let result = reader.get_app_id_version("missing-app", reads.inner.as_ref());
+    assert!(matches!(result, Err(KernelError::Cancelled)), "{result:?}");
 }
 
 /// Checks that cancelling a JSON read after successful batches terminates its iterator.

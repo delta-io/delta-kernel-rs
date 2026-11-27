@@ -1,21 +1,33 @@
 //! Integration tests for parsed-stats output.
 
+use std::sync::Arc;
+
+use delta_kernel::Snapshot;
 use delta_kernel::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, STATS_PARSED};
 use delta_kernel::arrow::array::{
-    Array, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int16Array, Int32Array,
-    Int64Array, Int8Array, RecordBatch, StringArray, StructArray,
+    Array, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int8Array, Int16Array,
+    Int32Array, Int64Array, RecordBatch, StringArray, StructArray,
 };
 use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::arrow::datatypes::DataType as ArrowDataType;
 use delta_kernel::arrow::util::display::{ArrayFormatter, FormatOptions};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::expressions::{Predicate as Pred, expr};
+use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::scan::StatsOptions;
+use delta_kernel::schema::schema_ref;
 use delta_kernel::table_features::ColumnMappingMode;
-use delta_kernel::Snapshot;
 use rstest::rstest;
+use serde_json::json;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
-use test_utils::table_builder::{unpartitioned, version_latest, FeatureSet, LogState, TableConfig};
-use test_utils::{get_column, test_context};
+use test_utils::table_builder::{FeatureSet, LogState, TableConfig, unpartitioned, version_latest};
+use test_utils::{
+    add_commit, create_table_and_load_snapshot, get_column, test_context, test_table_setup_mt,
+};
+use url::Url;
+
+use crate::common::read_utils::read_parquet_file;
+use crate::common::write_utils::{load_existing_single_file_checkpoint_path, set_table_properties};
 
 /// Validate that JSON stats object values match the corresponding parsed struct array.
 ///
@@ -224,6 +236,108 @@ fn scan_metadata_with_stats_columns_kernel_written(
     // file with the default 10 rows.
     assert_eq!(file_count, 1, "Should have processed exactly one file");
     assert_eq!(total_num_records, 10, "Should have exactly 10 numRecords");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkpoint_preserves_missing_empty_and_populated_stats_shapes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    let table_url = Url::from_directory_path(&table_path)
+        .map_err(|_| "table path should be a valid directory URL")?;
+    let schema = schema_ref! { nullable "id": LONG };
+    let snapshot = create_table_and_load_snapshot(&table_path, schema, engine.as_ref(), &[])?;
+    let snapshot = set_table_properties(
+        &table_path,
+        &table_url,
+        engine.as_ref(),
+        snapshot.version(),
+        &[
+            ("delta.checkpoint.writeStatsAsStruct", "true"),
+            ("delta.checkpoint.writeStatsAsJson", "false"),
+        ],
+    )?;
+
+    let actions = [
+        json!({
+            "add": {
+                "path": "missing-stats.parquet",
+                "partitionValues": {},
+                "size": 1,
+                "modificationTime": 1,
+                "dataChange": true,
+                "stats": null
+            }
+        }),
+        json!({
+            "add": {
+                "path": "empty-stats.parquet",
+                "partitionValues": {},
+                "size": 1,
+                "modificationTime": 1,
+                "dataChange": true,
+                "stats": "{}"
+            }
+        }),
+        json!({
+            "add": {
+                "path": "populated-stats.parquet",
+                "partitionValues": {},
+                "size": 1,
+                "modificationTime": 1,
+                "dataChange": true,
+                "stats": r#"{"numRecords":1,"minValues":{"id":1},"maxValues":{"id":1},"nullCount":{"id":0}}"#
+            }
+        }),
+    ]
+    .into_iter()
+    .map(|action| serde_json::to_string(&action))
+    .collect::<Result<Vec<_>, _>>()?
+    .join("\n");
+    let store = LocalFileSystem::new();
+    add_commit(table_url.as_str(), &store, snapshot.version() + 1, actions).await?;
+
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    snapshot.checkpoint(engine.as_ref(), None)?;
+
+    let checkpoint_path =
+        load_existing_single_file_checkpoint_path(&table_path, snapshot.version());
+    let checkpoint = read_parquet_file(&checkpoint_path);
+    let add = get_column!(checkpoint, "add", StructArray);
+    let add_rows = BooleanArray::from_iter((0..add.len()).map(|row| Some(add.is_valid(row))));
+    let checkpoint_adds = filter_record_batch(&checkpoint, &add_rows)?;
+    let add = get_column!(checkpoint_adds, "add", StructArray);
+    assert!(add.column_by_name("stats").is_none());
+    let paths = get_column!(add, "path", StringArray);
+    let stats_parsed = get_column!(add, STATS_PARSED, StructArray);
+    let mut validity: Vec<_> = (0..add.len())
+        .map(|row| (paths.value(row), stats_parsed.is_valid(row)))
+        .collect();
+    validity.sort_unstable();
+    assert_eq!(
+        validity,
+        vec![
+            ("empty-stats.parquet", true),
+            ("missing-stats.parquet", false),
+            ("populated-stats.parquet", true),
+        ]
+    );
+
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let predicate = Arc::new(Pred::from_expr(expr!(col("id") > 10i64)));
+    let scan = snapshot.scan_builder().with_predicate(predicate).build()?;
+    let mut selected_paths = Vec::new();
+    for scan_metadata in scan.scan_metadata(engine.as_ref())? {
+        selected_paths = scan_metadata?.visit_scan_files(selected_paths, |paths, file| {
+            paths.push(file.path);
+        })?;
+    }
+    selected_paths.sort_unstable();
+    assert_eq!(
+        selected_paths,
+        vec!["empty-stats.parquet", "missing-stats.parquet"]
+    );
+
+    Ok(())
 }
 
 #[test]
