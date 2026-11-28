@@ -407,10 +407,14 @@ fn add_version_context(version: Version, error: Error) -> Error {
     }
 }
 
-/// Adds commit-version context while preserving protocol and schema error kinds and typed
-/// cancellation.
+/// Adds commit-version context while preserving protocol and schema error kinds, typed
+/// cancellation, and a captured backtrace.
 fn with_version_context(version: Version, err: KernelError) -> KernelError {
     match err {
+        KernelError::Backtraced { source, backtrace } => KernelError::Backtraced {
+            source: Box::new(with_version_context(version, *source)),
+            backtrace,
+        },
         KernelError::Cancelled => KernelError::Cancelled,
         KernelError::Unsupported(msg) => {
             KernelError::Unsupported(format!("commit v={version}: {msg}"))

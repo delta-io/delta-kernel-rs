@@ -288,10 +288,9 @@ impl CommitSummary {
     /// that was dropped and added back under the same name is therefore reported as a
     /// [`SchemaChange::DropColumn`] and a [`SchemaChange::AddColumn`], even though
     /// [`schema`](Self::schema) names the same columns before and after. Without column mapping,
-    /// or while the range has not shown the table's protocol, fields are matched by their exact
-    /// name: a field whose name changes, even if only in case, is reported as a
-    /// [`SchemaChange::DropColumn`] and a [`SchemaChange::AddColumn`]. The order of the fields
-    /// of a struct is not compared.
+    /// fields are matched by their exact name: a field whose name changes, even if only in case,
+    /// is reported as a [`SchemaChange::DropColumn`] and a [`SchemaChange::AddColumn`]. The order
+    /// of the fields of a struct is not compared.
     ///
     /// A commit that changes the column mapping mode reports a
     /// [`SchemaChange::ChangeColumnMappingMode`], and its fields are matched by name unless
@@ -305,17 +304,20 @@ impl CommitSummary {
     ///
     /// On a table with adaptive metadata, the commit itself records whether it changes data,
     /// and that takes precedence over its files. This is `None` if such a commit does not
-    /// record it.
+    /// record it, and if a commit records neither that nor its file changes in the commit file.
     pub fn has_data_change(&self) -> Option<bool> {
         self.has_data_change
     }
 
-    /// The number of files the commit added, whether or not they change the table's data.
+    /// The number of files the commit added, whether or not they change the table's data. This
+    /// is `None` if the commit records its file changes only in the table's adaptive metadata
+    /// tree, which the summary plan does not read.
     pub fn num_added_files(&self) -> Option<i64> {
         self.num_added_files
     }
 
-    /// The number of files the commit removed, whether or not they change the table's data.
+    /// The number of files the commit removed, whether or not they change the table's data, or
+    /// `None` under the same condition as [`num_added_files`](Self::num_added_files).
     pub fn num_removed_files(&self) -> Option<i64> {
         self.num_removed_files
     }
@@ -370,7 +372,8 @@ impl TableShape {
     }
 
     /// The changes of the commit that turned `previous` into this shape, or `None` if they are
-    /// unknown: the commit made the column mapping mode known, so it may have changed the mode.
+    /// unknown: without the column mapping mode before the commit, Kernel knows neither whether
+    /// the commit changed the mode nor how to match the fields.
     ///
     /// `sets_metadata` tells whether the commit set the table's metadata. A commit that only
     /// sets the protocol leaves the schema as it is, but it can put the column mapping mode that
@@ -382,7 +385,7 @@ impl TableShape {
         sets_metadata: bool,
     ) -> KernelResult<Option<Vec<SchemaChange>>> {
         let mode_change = match (previous.column_mapping_mode, self.column_mapping_mode) {
-            (None, Some(_)) => return Ok(None),
+            (None, _) => return Ok(None),
             (Some(old_mode), Some(new_mode)) if old_mode != new_mode => {
                 Some(SchemaChange::ChangeColumnMappingMode { old_mode, new_mode })
             }
@@ -490,18 +493,25 @@ impl TableState {
             // The table's schema before or after the commit is unknown.
             _ => None,
         };
+        // A manifest commit whose content root is at its own version records its file changes
+        // only in the adaptive metadata tree. TODO(#2866): count them from the tree.
+        let files_only_in_tree = row
+            .content_root_version
+            .is_some_and(|root| Version::try_from(root) == Ok(version));
+        let files_in_commit = !files_only_in_tree;
         // On a table with adaptive metadata, the commit records whether it changes data, and
-        // that takes precedence over its files. While the table's features are unknown, a commit
-        // that records it is taken at its word.
+        // that takes precedence over its files. The protocol alone tells whether the table has
+        // adaptive metadata. While the protocol is unknown, a commit that records whether it
+        // changes data is taken at its word.
         let adaptive_metadata = self
-            .table_config
+            .protocol
             .as_ref()
-            .map(|config| config.is_feature_enabled(&TableFeature::AdaptiveMetadataPreview));
-        let files_change_data = row.num_data_change_files > 0;
+            .map(|protocol| protocol.has_table_feature(&TableFeature::AdaptiveMetadataPreview));
+        let files_change_data = files_in_commit.then_some(row.num_data_change_files > 0);
         let has_data_change = match adaptive_metadata {
             Some(true) => row.data_change,
-            Some(false) => Some(files_change_data),
-            None => Some(row.data_change.unwrap_or(files_change_data)),
+            Some(false) => files_change_data,
+            None => row.data_change.or(files_change_data),
         };
         Ok(CommitSummary {
             version,
@@ -509,8 +519,8 @@ impl TableState {
             table: self.schema.clone(),
             schema_changes,
             has_data_change,
-            num_added_files: Some(row.num_added_files),
-            num_removed_files: Some(row.num_removed_files),
+            num_added_files: files_in_commit.then_some(row.num_added_files),
+            num_removed_files: files_in_commit.then_some(row.num_removed_files),
             operation: row.operation,
             operation_metrics: row.operation_metrics,
         })
@@ -527,6 +537,8 @@ struct SummaryRow {
     operation_metrics: Option<HashMap<String, String>>,
     /// Whether the commit changes data according to its `commitInfo`.
     data_change: Option<bool>,
+    /// The content root version of the manifest commit that the `commitInfo` points at.
+    content_root_version: Option<i64>,
     num_protocol_actions: i64,
     num_metadata_actions: i64,
     num_commit_info_actions: i64,
@@ -571,6 +583,7 @@ impl RowVisitor for SummaryRowVisitor {
             operation,
             operation_metrics,
             data_change,
+            content_root_version,
             num_protocol_actions,
             num_metadata_actions,
             num_commit_info_actions,
@@ -597,6 +610,7 @@ impl RowVisitor for SummaryRowVisitor {
                 operation: operation.get_opt(row, OPERATION)?,
                 operation_metrics: operation_metrics.get_opt(row, OPERATION_METRICS)?,
                 data_change: data_change.get_opt(row, DATA_CHANGE)?,
+                content_root_version: content_root_version.get_opt(row, CONTENT_ROOT_VERSION)?,
                 num_protocol_actions: num_protocol_actions.get(row, NUM_PROTOCOL_ACTIONS)?,
                 num_metadata_actions: num_metadata_actions.get(row, NUM_METADATA_ACTIONS)?,
                 num_commit_info_actions: num_commit_info_actions
@@ -615,6 +629,8 @@ const VERSION: &str = "version";
 const IN_COMMIT_TIMESTAMP: &str = "inCommitTimestamp";
 const OPERATION: &str = "operation";
 const OPERATION_METRICS: &str = "operationMetrics";
+const LAST_MANIFEST_COMMIT: &str = "lastManifestCommit";
+const CONTENT_ROOT_VERSION: &str = "contentRootVersion";
 const NUM_PROTOCOL_ACTIONS: &str = "numProtocolActions";
 const NUM_METADATA_ACTIONS: &str = "numMetadataActions";
 const NUM_COMMIT_INFO_ACTIONS: &str = "numCommitInfoActions";
@@ -677,6 +693,9 @@ fn commit_info_field() -> StructField {
             nullable OPERATION: STRING,
             nullable OPERATION_METRICS: { STRING => nullable STRING },
             nullable DATA_CHANGE: BOOLEAN,
+            nullable LAST_MANIFEST_COMMIT: {
+                nullable CONTENT_ROOT_VERSION: LONG,
+            },
         },
     )
 }

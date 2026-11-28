@@ -21,6 +21,7 @@ use delta_kernel_ffi_macros::handle_descriptor;
 
 use super::SharedCommitRange;
 use crate::handle::Handle;
+use crate::panic::catch_panic;
 use crate::{
     ExclusiveEngineData, ExternResult, IntoExternResult, KernelOwnedBytes, SharedExternEngine,
     SharedSnapshot,
@@ -70,10 +71,11 @@ pub unsafe extern "C" fn commit_range_get_commit_summary_plan(
     commit_range: Handle<SharedCommitRange>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<SharedCommitSummaryPlan>> {
-    let engine = unsafe { engine.as_ref() };
-    let commit_range = unsafe { commit_range.as_ref() };
-    let result = get_commit_summary_plan_impl(commit_range, None);
-    unsafe { result.into_extern_result(&engine) }
+    let result = catch_panic(|| {
+        let commit_range = unsafe { commit_range.as_ref() };
+        get_commit_summary_plan_impl(commit_range, None)
+    });
+    unsafe { result.into_extern_result(&engine.as_ref()) }
 }
 
 /// Like [`commit_range_get_commit_summary_plan`], but validates the commits against the protocol
@@ -91,11 +93,12 @@ pub unsafe extern "C" fn commit_range_get_commit_summary_plan_with_snapshot(
     engine: Handle<SharedExternEngine>,
     start_snapshot: Handle<SharedSnapshot>,
 ) -> ExternResult<Handle<SharedCommitSummaryPlan>> {
-    let engine = unsafe { engine.as_ref() };
-    let commit_range = unsafe { commit_range.as_ref() };
-    let start_snapshot = unsafe { start_snapshot.clone_as_arc() };
-    let result = get_commit_summary_plan_impl(commit_range, Some(start_snapshot));
-    unsafe { result.into_extern_result(&engine) }
+    let result = catch_panic(|| {
+        let commit_range = unsafe { commit_range.as_ref() };
+        let start_snapshot = unsafe { start_snapshot.clone_as_arc() };
+        get_commit_summary_plan_impl(commit_range, Some(start_snapshot))
+    });
+    unsafe { result.into_extern_result(&engine.as_ref()) }
 }
 
 /// Returns the plan of `plan` as a proto-serialized `delta.kernel.operation.Operation` message
@@ -164,13 +167,14 @@ pub unsafe extern "C" fn commit_summary_plan_validate(
     plan_result: *mut Handle<ExclusiveEngineData>,
     plan_result_len: usize,
 ) -> ExternResult<Handle<ExclusiveEngineData>> {
-    // Take ownership of every batch before anything else can fail.
-    let batches = unsafe { take_batches(plan_result, plan_result_len) };
-    let extern_engine = unsafe { engine.as_ref() };
-    let plan = unsafe { plan.as_ref() };
-    let result =
-        batches.and_then(|batches| validate_impl(plan, extern_engine.engine().as_ref(), batches));
-    unsafe { result.into_extern_result(&extern_engine) }
+    let result = catch_panic(|| {
+        // Take ownership of every batch before anything else can fail.
+        let batches = unsafe { take_batches(plan_result, plan_result_len) }?;
+        let plan = unsafe { plan.as_ref() };
+        let engine = unsafe { engine.as_ref() };
+        validate_impl(plan, engine.engine().as_ref(), batches)
+    });
+    unsafe { result.into_extern_result(&engine.as_ref()) }
 }
 
 /// Takes ownership of the `len` engine data handles at `ptr`.

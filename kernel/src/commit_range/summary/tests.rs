@@ -552,6 +552,24 @@ async fn changes_are_unknown_for_the_commit_that_makes_the_column_mapping_mode_k
 }
 
 #[tokio::test]
+async fn changes_are_unknown_while_the_column_mapping_mode_is_unknown() {
+    let before = StructType::try_new([mapped_int("id", 1)]).unwrap();
+    let after = StructType::try_new([mapped_int("id", 2)]).unwrap();
+    // Without a start snapshot, the range shows the metadata but never the protocol. Whether
+    // version 1 kept the column `id` or replaced it under the same name depends on whether column
+    // mapping is in effect.
+    let commits = [
+        (0, &*column_mapping_metadata_line(&before)),
+        (1, &*column_mapping_metadata_line(&after)),
+    ];
+
+    let summaries = summarize_commits(&commits, 0, 1).await.unwrap();
+
+    assert!(summaries[1].schema().is_some());
+    assert!(summaries[1].schema_changes().is_none());
+}
+
+#[tokio::test]
 async fn changes_are_unknown_for_a_first_commit_that_only_sets_the_protocol() {
     let schema = StructType::try_new([mapped_int("id", 1)]).unwrap();
     // Version 1 raises the protocol, which puts column mapping into effect. As the first commit
@@ -705,6 +723,24 @@ fn adaptive_metadata_commit_records_whether_it_changes_data() {
     assert_eq!(has_data_change(adaptive, file_row(None, 2)), None);
 }
 
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[test]
+fn protocol_alone_tells_that_a_table_has_adaptive_metadata() {
+    use crate::unit_test_utils::MockProtocolBuilder;
+
+    let protocol = MockProtocolBuilder::new()
+        .with_features([TableFeature::AdaptiveMetadataPreview])
+        .build();
+    // Without a start snapshot, the range shows the protocol but not the metadata.
+    let sets_protocol = SummaryRow {
+        protocol: Some(protocol),
+        num_protocol_actions: 1,
+        ..file_row(None, 2)
+    };
+
+    assert_eq!(has_data_change(None, sets_protocol), None);
+}
+
 #[test]
 fn commit_without_adaptive_metadata_changes_data_if_its_files_do() {
     let plain = MockTableConfigurationBuilder::new().build();
@@ -732,12 +768,54 @@ async fn commit_that_records_its_data_change_is_taken_at_its_word_while_features
     assert_eq!(facts(&summaries[1]), (Some(true), [Some(1), Some(0)]));
 }
 
+#[tokio::test]
+async fn file_facts_are_unknown_for_a_commit_that_records_its_files_in_the_metadata_tree() {
+    // Versions 1 and 3 are manifest commits whose content root is at their own version, so
+    // their file changes are in the metadata tree. Version 2 carries the pointer to version 1
+    // forward, and its commit file holds its file changes.
+    let in_tree = r#"{"commitInfo":{"timestamp":0,"dataChange":true,"lastManifestCommit":{"version":1,"contentRootVersion":1}}}"#;
+    let in_commit_file = [
+        r#"{"commitInfo":{"timestamp":0,"lastManifestCommit":{"version":1,"contentRootVersion":1}}}"#,
+        &add_line("a", true),
+    ]
+    .join("\n");
+    let in_tree_without_data_change = r#"{"commitInfo":{"timestamp":0,"lastManifestCommit":{"version":3,"contentRootVersion":3}}}"#;
+    let commits = [
+        (0, COMMIT_INFO_NO_ICT),
+        (1, in_tree),
+        (2, &*in_commit_file),
+        (3, in_tree_without_data_change),
+    ];
+
+    let summaries = summarize_commits(&commits, 0, 3).await.unwrap();
+
+    assert_eq!(facts(&summaries[1]), (Some(true), [None, None]));
+    assert_eq!(facts(&summaries[2]), (Some(true), [Some(1), Some(0)]));
+    assert_eq!(facts(&summaries[3]), (None, [None, None]));
+}
+
 #[test]
 fn version_context_keeps_schema_errors_as_schema_errors() {
     let error = with_version_context(3, KernelError::schema("no column mapping ID"));
 
     assert!(matches!(
         error,
+        KernelError::Schema(message) if message == "commit v=3: no column mapping ID"
+    ));
+}
+
+#[test]
+fn version_context_keeps_the_kind_and_the_backtrace_of_a_backtraced_schema_error() {
+    let error = KernelError::Backtraced {
+        source: Box::new(KernelError::schema("no column mapping ID")),
+        backtrace: Box::new(std::backtrace::Backtrace::force_capture()),
+    };
+
+    let error = with_version_context(3, error);
+
+    assert!(matches!(error, KernelError::Backtraced { .. }));
+    assert!(matches!(
+        error.without_backtrace(),
         KernelError::Schema(message) if message == "commit v=3: no column mapping ID"
     ));
 }
