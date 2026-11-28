@@ -1,3 +1,5 @@
+//! Exercises table reads and scan metadata through the public APIs.
+
 // Scan-metadata cancellation is a read-path concern, so its coverage lives alongside the other
 // read tests.
 mod scan_cancellation;
@@ -5,6 +7,7 @@ mod schema_nullability;
 #[cfg(feature = "udt-in-dev")]
 mod user_defined;
 
+use std::num::NonZero;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::vec;
@@ -26,6 +29,7 @@ use delta_kernel::expressions::{
 };
 use delta_kernel::log_segment::LogSegment;
 use delta_kernel::object_store::ObjectStoreExt as _;
+use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::parquet::file::properties::{EnabledStatistics, WriterProperties};
@@ -36,6 +40,7 @@ use delta_kernel::schema::{DataType, MetadataColumnSpec, Schema, StructField, sc
 use delta_kernel::{Engine, FileMeta, Snapshot};
 use itertools::Itertools;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
+use test_utils::engine_contract::test_json_handler_file_path_contract;
 use test_utils::{
     IntoArray, METADATA, TestAction, actions_to_string, add_commit, generate_batch,
     generate_simple_batch, into_record_batch, load_test_data, read_scan, record_batch_to_bytes,
@@ -59,6 +64,16 @@ fn make_top_level_fields_nullable(batch: &RecordBatch) -> RecordBatch {
             .collect::<Vec<_>>(),
     ));
     RecordBatch::try_new(schema, batch.columns().to_vec()).unwrap()
+}
+
+#[rstest::rstest]
+fn json_reader_preserves_file_paths_across_batches_and_empty_files(
+    #[values(1, 2, 100)] batch_size: usize,
+) {
+    let engine = DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new()))
+        .with_batch_size(NonZero::new(batch_size).unwrap())
+        .build();
+    test_json_handler_file_path_contract(engine.json_handler().as_ref());
 }
 
 #[tokio::test]
