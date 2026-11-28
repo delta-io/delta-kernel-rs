@@ -121,6 +121,9 @@ schema-diff = []
 # Declarative plan IR (experimental).
 declarative-plans = ["internal-api", "dep:prost", "dep:prost-build"]
 
+# Experimental, temporary feature flag guarding the in-progress declarative plans for change data
+# feed. The APIs it enables may change without notice.
+declarative-cdf-in-dev = ["declarative-plans"]
 # Sources a prebuilt `protoc` for the codegen `declarative-plans` runs, so the build needs no
 # system protobuf install. Leave it off to pass `protoc` through the `PROTOC` env var instead;
 # a build that pins a hermetic toolchain cannot use a downloaded binary.

@@ -134,6 +134,21 @@ success; on error, it drops the builder. The caller must pass the final returned
 `free_commit_range` and the commits iterator with `free_commit_actions_iter`. Each
 `SharedCommitAction` handed to the visitor must be released with `free_commit_action`.
 
+With the `declarative-cdf-in-dev` feature, a range can also summarize its commits through a
+declarative plan (`ffi/src/commit_range/summary.rs`). The engine executes the plan itself and
+hands the result back for validation:
+
+```
+commit_range_get_commit_summary_plan(range, engine)          // -> SharedCommitSummaryPlan
+     // or commit_range_get_commit_summary_plan_with_snapshot(range, engine, start_snapshot)
+  -> commit_summary_plan_get_plan(plan)                      // -> proto bytes of the plan to execute
+  -> commit_summary_plan_validate(plan, engine, batches, n)  // -> ExclusiveEngineData: one row per commit
+```
+
+`commit_summary_plan_validate` consumes every engine data handle it is given, on success and on
+error. Free the plan bytes with `free_kernel_bytes` and the plan with `free_commit_summary_plan`.
+The columns of the returned batch are documented on `commit_summary_plan_validate`.
+
 ## Incremental Scan Flow
 
 An incremental scan streams the file-action diff between a base version and a target snapshot

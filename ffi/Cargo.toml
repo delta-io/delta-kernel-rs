@@ -76,6 +76,10 @@ default-engine-base = ["delta_kernel/default-engine-base", "dep:delta_kernel_def
 # the plan executor with `ArrowEvaluationHandler`
 declarative-plans = ["delta_kernel/declarative-plans", "dep:prost", "arrow", "default-engine-base"]
 
+# Experimental, temporary feature flag guarding the in-progress declarative plans for change data
+# feed. The exports it enables may change without notice.
+declarative-cdf-in-dev = ["declarative-plans", "delta_kernel/declarative-cdf-in-dev"]
+
 vendored-protoc = ["delta_kernel/vendored-protoc"]
 
 tracing = [ "tracing-core", "tracing-subscriber" ]

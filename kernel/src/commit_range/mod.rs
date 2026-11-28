@@ -20,6 +20,23 @@
 //! the snapshot is `None`, validation is purely commit-driven. See [`CommitRange::commits`]
 //! for protocol-validation details.
 //!
+//! # Commit summaries
+//!
+//! With the experimental `declarative-cdf-in-dev` feature, `CommitRange::get_commit_summary_plan`
+//! describes each commit of the range without exposing its actions: its version and timestamp,
+//! the table's schema and partition columns, the schema changes it made, whether it changed data,
+//! how many files it added and removed, and the operation and metrics its writer recorded. Prefer
+//! it to [`CommitRange::commits`] when a connector needs these facts for many commits and can
+//! execute a declarative plan: the plan reads the commit files in parallel, where the iterator
+//! reads them one at a time.
+//!
+//! Summarizing takes two steps. The connector executes the returned plan with its own query
+//! engine, then hands the rows back to kernel, which validates every commit in ascending version
+//! order and returns the summaries in the range's [`CommitOrdering`]. Kernel checks what the Delta
+//! protocol defines, namely that it can read each commit's protocol and metadata and which
+//! timestamp a commit has. Connector policy stays with the connector: whether a schema change is
+//! compatible with a read, and which change data feed processing a range of commits needs.
+//!
 //! # Example
 //! ```no_run
 //! use std::sync::Arc;
@@ -51,6 +68,10 @@
 
 mod actions;
 mod builder;
+#[cfg(feature = "declarative-cdf-in-dev")]
+mod schema_changes;
+#[cfg(feature = "declarative-cdf-in-dev")]
+mod summary;
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -58,6 +79,10 @@ use std::sync::Arc;
 pub use actions::{CommitAction, DeltaAction};
 pub use builder::{CommitOrdering, CommitRangeBuilder};
 use delta_kernel_derive::internal_api;
+#[cfg(feature = "declarative-cdf-in-dev")]
+pub use schema_changes::SchemaChange;
+#[cfg(feature = "declarative-cdf-in-dev")]
+pub use summary::{CommitSummary, CommitSummaryPlan};
 use url::Url;
 
 use crate::actions::{
@@ -68,6 +93,7 @@ use crate::actions::{
 use crate::path::ParsedLogPath;
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType};
 use crate::snapshot::SnapshotRef;
+use crate::table_configuration::TableConfiguration;
 use crate::table_features::Operation;
 use crate::transforms::{SchemaTransform, transform_output_type};
 use crate::utils::require;
@@ -194,12 +220,7 @@ impl CommitRange {
         start_snapshot: Option<SnapshotRef>,
         actions: &[DeltaAction],
     ) -> Result<impl Iterator<Item = Result<CommitAction>> + Send + use<>> {
-        require!(
-            self.supports_commit_actions,
-            Error::Kernel(KernelError::CommitRange(
-                "Commit action iteration is not supported for this range".to_string()
-            ))
-        );
+        self.require_commit_actions_supported()?;
         if actions.is_empty() {
             return Err(Error::Kernel(KernelError::CommitRange(
                 "at least one DeltaAction must be requested".to_string(),
@@ -208,25 +229,12 @@ impl CommitRange {
 
         let (latest_protocol, latest_metadata) = match &start_snapshot {
             Some(snapshot) => {
-                if snapshot.table_root() != &self.table_root {
-                    return Err(Error::Kernel(KernelError::CommitRange(format!(
-                        "snapshot table root ({}) does not match commit range table root ({})",
-                        snapshot.table_root(),
-                        self.table_root,
-                    ))));
-                }
                 let (anchor_version, anchor_name) = match self.commit_ordering {
                     CommitOrdering::AscendingOrder => (self.start_version, "start_version"),
                     CommitOrdering::DescendingOrder => (self.end_version, "end_version"),
                 };
-                if snapshot.version() != anchor_version {
-                    return Err(Error::Kernel(KernelError::CommitRange(format!(
-                        "snapshot version {} does not match {anchor_name} ({anchor_version})",
-                        snapshot.version(),
-                    ))));
-                }
-                let table_config = snapshot.table_configuration();
-                table_config.ensure_operation_supported(Operation::Scan)?;
+                let table_config =
+                    self.snapshot_configuration(snapshot, anchor_version, anchor_name)?;
                 (
                     Some(table_config.protocol().clone()),
                     Some(table_config.metadata().clone()),
@@ -246,6 +254,43 @@ impl CommitRange {
             latest_protocol,
             latest_metadata,
         })
+    }
+
+    fn require_commit_actions_supported(&self) -> KernelResult<()> {
+        require!(
+            self.supports_commit_actions,
+            KernelError::CommitRange(
+                "Commit action iteration is not supported for this range".to_string()
+            )
+        );
+        Ok(())
+    }
+
+    /// Returns the table configuration of `snapshot` after checking that the snapshot belongs to
+    /// this range's table at `anchor_version` and that kernel can scan it. `anchor_name` names the
+    /// anchor in errors.
+    fn snapshot_configuration<'a>(
+        &self,
+        snapshot: &'a SnapshotRef,
+        anchor_version: Version,
+        anchor_name: &str,
+    ) -> Result<&'a TableConfiguration> {
+        if snapshot.table_root() != &self.table_root {
+            return Err(Error::Kernel(KernelError::CommitRange(format!(
+                "snapshot table root ({}) does not match commit range table root ({})",
+                snapshot.table_root(),
+                self.table_root,
+            ))));
+        }
+        if snapshot.version() != anchor_version {
+            return Err(Error::Kernel(KernelError::CommitRange(format!(
+                "snapshot version {} does not match {anchor_name} ({anchor_version})",
+                snapshot.version(),
+            ))));
+        }
+        let table_config = snapshot.table_configuration();
+        table_config.ensure_operation_supported(Operation::Scan)?;
+        Ok(table_config)
     }
 }
 
@@ -338,10 +383,7 @@ impl CommitActionsIterator {
             self.latest_protocol.clone(),
             self.latest_metadata.clone(),
         )
-        .map_err(|e| match e {
-            Error::Kernel(e) => Error::Kernel(with_version_context(version, e)),
-            Error::Delta(error) => Error::Delta(error.with_context(format!("commit v={version}"))),
-        })?;
+        .map_err(|error| add_version_context(version, error))?;
 
         match self.commit_ordering {
             CommitOrdering::AscendingOrder => {
@@ -357,9 +399,22 @@ impl CommitActionsIterator {
     }
 }
 
-/// Adds commit-version context while preserving protocol error kinds and typed cancellation.
+/// Adds commit-version context to `error`, whichever kind it is.
+fn add_version_context(version: Version, error: Error) -> Error {
+    match error {
+        Error::Kernel(error) => Error::Kernel(with_version_context(version, error)),
+        Error::Delta(error) => Error::Delta(error.with_context(format!("commit v={version}"))),
+    }
+}
+
+/// Adds commit-version context while preserving protocol and schema error kinds, typed
+/// cancellation, and a captured backtrace.
 fn with_version_context(version: Version, err: KernelError) -> KernelError {
     match err {
+        KernelError::Backtraced { source, backtrace } => KernelError::Backtraced {
+            source: Box::new(with_version_context(version, *source)),
+            backtrace,
+        },
         KernelError::Cancelled => KernelError::Cancelled,
         KernelError::Unsupported(msg) => {
             KernelError::Unsupported(format!("commit v={version}: {msg}"))
@@ -367,6 +422,7 @@ fn with_version_context(version: Version, err: KernelError) -> KernelError {
         KernelError::InvalidProtocol(msg) => {
             KernelError::InvalidProtocol(format!("commit v={version}: {msg}"))
         }
+        KernelError::Schema(msg) => KernelError::Schema(format!("commit v={version}: {msg}")),
         other => KernelError::generic(format!("commit v={version}: {other}")),
     }
 }
@@ -872,7 +928,9 @@ mod tests {
     /// Build an in-memory engine pre-loaded with `commits` (each `(version, body)` pair becomes
     /// a commit JSON file) and return `(engine, table_root)`. Tests that need a forged commit
     /// log use this instead of touching the filesystem.
-    async fn engine_with_commits(commits: &[(u64, &str)]) -> (Arc<dyn Engine>, &'static str) {
+    pub(super) async fn engine_with_commits(
+        commits: &[(u64, &str)],
+    ) -> (Arc<dyn Engine>, &'static str) {
         let store = Arc::new(InMemory::new());
         let table_root = "memory:///";
         let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new_with_store(store.clone()));
@@ -901,9 +959,10 @@ mod tests {
         Ok(())
     }
 
-    const VALID_PROTOCOL_LINE: &str = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":1}}"#;
-    const UNSUPPORTED_PROTOCOL_LINE: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["futureFeature"],"writerFeatures":["futureFeature"]}}"#;
-    const VALID_METADATA_LINE: &str = r#"{"metaData":{"id":"00000000-0000-0000-0000-000000000000","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{},"createdTime":1000}}"#;
+    pub(super) const VALID_PROTOCOL_LINE: &str =
+        r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":1}}"#;
+    pub(super) const UNSUPPORTED_PROTOCOL_LINE: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["futureFeature"],"writerFeatures":["futureFeature"]}}"#;
+    pub(super) const VALID_METADATA_LINE: &str = r#"{"metaData":{"id":"00000000-0000-0000-0000-000000000000","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{},"createdTime":1000}}"#;
     /// Like [`VALID_METADATA_LINE`] but with a non-empty `configuration` (`foo=bar`), used to
     /// forge a metadata-only change in a later commit.
     const METADATA_CONFIG_CHANGE_LINE: &str = r#"{"metaData":{"id":"00000000-0000-0000-0000-000000000000","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{"foo":"bar"},"createdTime":2000}}"#;
@@ -1238,9 +1297,10 @@ mod tests {
         }
     }
 
-    const ICT_PROTOCOL_LINE: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":[],"writerFeatures":["inCommitTimestamp"]}}"#;
-    const ICT_METADATA_ENABLED: &str = r#"{"metaData":{"id":"00000000-0000-0000-0000-000000000000","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{"delta.enableInCommitTimestamps":"true"},"createdTime":1000}}"#;
-    const COMMIT_INFO_NO_ICT: &str = r#"{"commitInfo":{"timestamp":0,"operation":"WRITE"}}"#;
+    pub(super) const ICT_PROTOCOL_LINE: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":[],"writerFeatures":["inCommitTimestamp"]}}"#;
+    pub(super) const ICT_METADATA_ENABLED: &str = r#"{"metaData":{"id":"00000000-0000-0000-0000-000000000000","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{"delta.enableInCommitTimestamps":"true"},"createdTime":1000}}"#;
+    pub(super) const COMMIT_INFO_NO_ICT: &str =
+        r#"{"commitInfo":{"timestamp":0,"operation":"WRITE"}}"#;
 
     fn ict_metadata_enabled_at(enablement_version: Version, enablement_ts: i64) -> String {
         format!(
@@ -1248,10 +1308,33 @@ mod tests {
         )
     }
 
-    fn commit_info_with_ict(ts: i64) -> String {
+    pub(super) fn commit_info_with_ict(ts: i64) -> String {
         format!(
             r#"{{"commitInfo":{{"inCommitTimestamp":{ts},"timestamp":0,"operation":"WRITE"}}}}"#
         )
+    }
+
+    /// Gives `field` the column mapping ID `id` and a physical name derived from it.
+    #[cfg(feature = "declarative-cdf-in-dev")]
+    pub(super) fn mapped(field: crate::schema::StructField, id: i64) -> crate::schema::StructField {
+        use crate::schema::{ColumnMetadataKey, MetadataValue};
+        field.with_metadata([
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(id),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String(format!("col-{id}")),
+            ),
+        ])
+    }
+
+    /// A nullable INTEGER field with the column mapping ID `id`.
+    #[cfg(feature = "declarative-cdf-in-dev")]
+    pub(super) fn mapped_int(name: &str, id: i64) -> crate::schema::StructField {
+        use crate::schema::{DataType, StructField};
+        mapped(StructField::nullable(name, DataType::INTEGER), id)
     }
 
     #[derive(Clone, Copy)]

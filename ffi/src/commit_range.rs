@@ -1,3 +1,6 @@
+#[cfg(feature = "declarative-cdf-in-dev")]
+pub mod summary;
+
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use delta_kernel::commit_range::{CommitAction, CommitRange, DeltaAction as KernelDeltaAction};

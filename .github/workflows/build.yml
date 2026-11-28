@@ -547,7 +547,7 @@ jobs:
           printf 'CARGO_INCREMENTAL=%s\n' "$CARGO_INCREMENTAL" \
             | tee target/ci-telemetry/miri-settings.txt
           pushd ffi
-          MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-provenance-gc=1000000" cargo miri nextest run --locked --features default-engine-rustls,delta-kernel-unity-catalog,declarative-plans,vendored-protoc,geo-type-in-dev --partition slice:${{ matrix.partition }}/5
+          MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-provenance-gc=1000000" cargo miri nextest run --locked --features default-engine-rustls,delta-kernel-unity-catalog,declarative-plans,vendored-protoc,geo-type-in-dev,declarative-cdf-in-dev --partition slice:${{ matrix.partition }}/5
       - name: Check Miri timing report
         run: test -s target/nextest/default-miri/junit.xml
       - name: Upload Miri timings and runner information
