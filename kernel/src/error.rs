@@ -647,13 +647,6 @@ impl KernelError {
     pub(crate) fn row_tracking_change_feed_unsupported(version: impl Into<Version>) -> Self {
         Self::RowTrackingChangeFeedUnsupported(version.into())
     }
-    pub(crate) fn change_data_feed_incompatible_schema(
-        expected: &StructType,
-        actual: &StructType,
-    ) -> Self {
-        Self::ChangeDataFeedIncompatibleSchema(expected.to_string(), actual.to_string())
-    }
-
     /// Creates an incompatible-schema error that identifies the version of `actual`.
     pub(crate) fn change_data_feed_incompatible_schema_at_version(
         expected: &StructType,
